@@ -70,7 +70,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                 match catalog.list_databases().await {
                     Ok(names) => names,
                     Err(e) => {
-                        log::warn!("failed to list databases: {e}");
+                        log::error!("failed to list databases: {e}");
                         vec![]
                     }
                 }
@@ -176,7 +176,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                 match catalog.list_tables(&database).await {
                     Ok(names) => names,
                     Err(e) => {
-                        log::warn!("failed to list tables in '{}': {e}", database);
+                        log::error!("failed to list tables in '{}': {e}", database);
                         vec![]
                     }
                 }
@@ -228,7 +228,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                     Ok(_) => true,
                     Err(paimon::Error::TableNotExist { .. }) => false,
                     Err(e) => {
-                        log::warn!("failed to check table '{}': {e}", identifier);
+                        log::error!("failed to check table '{}': {e}", identifier);
                         false
                     }
                 }
