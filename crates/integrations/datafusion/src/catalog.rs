@@ -83,12 +83,10 @@ impl CatalogProvider for PaimonCatalogProvider {
         // Return the provider optimistically without calling get_database.
         // Errors (e.g. permission denied, database not exist) will surface
         // later in table() which has a proper Result error channel.
-        Some(
-            Arc::new(PaimonSchemaProvider::new(
-                Arc::clone(&self.catalog),
-                name.to_string(),
-            )) as Arc<dyn SchemaProvider>,
-        )
+        Some(Arc::new(PaimonSchemaProvider::new(
+            Arc::clone(&self.catalog),
+            name.to_string(),
+        )) as Arc<dyn SchemaProvider>)
     }
 
     fn register_schema(
