@@ -66,26 +66,28 @@ impl CatalogProvider for PaimonCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
         let catalog = Arc::clone(&self.catalog);
         block_on_with_runtime(
-            async move { catalog.list_databases().await.unwrap_or_default() },
+            async move {
+                match catalog.list_databases().await {
+                    Ok(names) => names,
+                    Err(e) => {
+                        log::warn!("failed to list databases: {e}");
+                        vec![]
+                    }
+                }
+            },
             "paimon catalog access thread panicked",
         )
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let catalog = Arc::clone(&self.catalog);
-        let name = name.to_string();
-        block_on_with_runtime(
-            async move {
-                match catalog.get_database(&name).await {
-                    Ok(_) => Some(
-                        Arc::new(PaimonSchemaProvider::new(Arc::clone(&catalog), name))
-                            as Arc<dyn SchemaProvider>,
-                    ),
-                    Err(paimon::Error::DatabaseNotExist { .. }) => None,
-                    Err(_) => None,
-                }
-            },
-            "paimon catalog access thread panicked",
+        // Return the provider optimistically without calling get_database.
+        // Errors (e.g. permission denied, database not exist) will surface
+        // later in table() which has a proper Result error channel.
+        Some(
+            Arc::new(PaimonSchemaProvider::new(
+                Arc::clone(&self.catalog),
+                name.to_string(),
+            )) as Arc<dyn SchemaProvider>,
         )
     }
 
@@ -170,7 +172,15 @@ impl SchemaProvider for PaimonSchemaProvider {
         let catalog = Arc::clone(&self.catalog);
         let database = self.database.clone();
         block_on_with_runtime(
-            async move { catalog.list_tables(&database).await.unwrap_or_default() },
+            async move {
+                match catalog.list_tables(&database).await {
+                    Ok(names) => names,
+                    Err(e) => {
+                        log::warn!("failed to list tables in '{}': {e}", database);
+                        vec![]
+                    }
+                }
+            },
             "paimon catalog access thread panicked",
         )
     }
@@ -217,7 +227,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                 match catalog.get_table(&identifier).await {
                     Ok(_) => true,
                     Err(paimon::Error::TableNotExist { .. }) => false,
-                    Err(_) => false,
+                    Err(e) => {
+                        log::warn!("failed to check table '{}': {e}", identifier);
+                        false
+                    }
                 }
             },
             "paimon catalog access thread panicked",
