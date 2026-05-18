@@ -1220,7 +1220,12 @@ impl SQLContext {
             .clone()
     }
 
-    fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
+    /// Returns the Paimon catalog currently set as default.
+    ///
+    /// Exposed so callers that need the registered [`Catalog`] (for example to
+    /// register a table-valued function against it) can retrieve it without
+    /// keeping a duplicate handle of their own.
+    pub fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
         let name = self.current_catalog_name();
         self.catalogs.get(&name).cloned().ok_or_else(|| {
             DataFusionError::Plan(

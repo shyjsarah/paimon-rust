@@ -23,7 +23,10 @@ use datafusion::catalog::CatalogProvider;
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use paimon::{CatalogFactory, Options};
-use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
+use paimon_datafusion::{
+    register_full_text_search, register_vector_search, PaimonCatalogProvider, SQLContext,
+};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
@@ -146,6 +149,37 @@ impl PySQLContext {
         self.inner
             .register_temp_table(&name, Arc::new(mem_table))
             .map_err(df_to_py_err)
+    }
+
+    /// Registers a built-in Paimon table-valued function (UDTF) on the session
+    /// so it can be used in SQL, e.g.
+    /// `SELECT * FROM vector_search('items', 'embedding', '[1.0, 0.0]', 10)`.
+    ///
+    /// `name` selects the function; supported values are `vector_search` and
+    /// `full_text_search`. The function is bound to the current catalog, so a
+    /// catalog must already be registered (the first `register_catalog` call
+    /// also sets it current). `default_database` defaults to `"default"` and
+    /// resolves the table-name argument the function receives in SQL.
+    #[pyo3(signature = (name, default_database=None))]
+    fn register_table_function(
+        &self,
+        name: String,
+        default_database: Option<String>,
+    ) -> PyResult<()> {
+        let catalog = self.inner.current_catalog().map_err(df_to_py_err)?;
+        let default_database = default_database.as_deref().unwrap_or("default");
+        let ctx = self.inner.ctx();
+        match name.as_str() {
+            "vector_search" => register_vector_search(ctx, catalog, default_database),
+            "full_text_search" => register_full_text_search(ctx, catalog, default_database),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown table function '{other}'; \
+                     supported: 'vector_search', 'full_text_search'"
+                )))
+            }
+        }
+        Ok(())
     }
 
     fn sql(&self, py: Python<'_>, sql: String) -> PyResult<Vec<Py<PyAny>>> {
