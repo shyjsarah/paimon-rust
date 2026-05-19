@@ -140,11 +140,7 @@ impl SQLContext {
         // they are usable in SQL without any extra registration call.
         crate::vector_search::register_vector_search(&self.ctx, catalog.clone(), default_db);
         #[cfg(feature = "fulltext")]
-        crate::full_text_search::register_full_text_search(
-            &self.ctx,
-            catalog.clone(),
-            default_db,
-        );
+        crate::full_text_search::register_full_text_search(&self.ctx, catalog.clone(), default_db);
         crate::referenced_files_size::register_referenced_files_size(
             &self.ctx,
             catalog.clone(),
