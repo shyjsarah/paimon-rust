@@ -141,16 +141,6 @@ impl SQLContext {
         crate::vector_search::register_vector_search(&self.ctx, catalog.clone(), default_db);
         #[cfg(feature = "fulltext")]
         crate::full_text_search::register_full_text_search(&self.ctx, catalog.clone(), default_db);
-        crate::referenced_files_size::register_referenced_files_size(
-            &self.ctx,
-            catalog.clone(),
-            default_db,
-        );
-        crate::physical_files_size::register_physical_files_size(
-            &self.ctx,
-            catalog.clone(),
-            default_db,
-        );
         self.catalogs.insert(catalog_name.clone(), catalog);
         if is_first {
             self.set_current_catalog(catalog_name).await?;

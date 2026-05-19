@@ -180,20 +180,17 @@ def test_register_batch_invalid_catalog():
 
 
 def test_table_functions_registered_with_catalog():
-    """register_catalog auto-registers the built-in table-valued functions, so
-    they are callable in SQL without any extra registration step."""
+    """register_catalog auto-registers vector_search / full_text_search as
+    UDTFs. Calling one with the wrong argument count surfaces the function's
+    own validation error, which proves it is registered — an unregistered
+    name would instead fail with 'table function not found'."""
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
-        ctx.sql("CREATE SCHEMA paimon.test_db")
-        ctx.sql("CREATE TABLE paimon.test_db.t (id INT, name STRING)")
-        ctx.sql("INSERT INTO paimon.test_db.t VALUES (1, 'alice')")
 
-        referenced = ctx.sql("SELECT * FROM referenced_files_size('test_db.t')")
-        assert pa.Table.from_batches(referenced).num_rows > 0
-
-        physical = ctx.sql("SELECT * FROM physical_files_size('test_db.t')")
-        assert pa.Table.from_batches(physical).num_rows > 0
-
-        ctx.sql("DROP TABLE paimon.test_db.t")
-        ctx.sql("DROP SCHEMA paimon.test_db")
+        for fn in ("vector_search", "full_text_search"):
+            try:
+                ctx.sql(f"SELECT * FROM {fn}('only_one_arg')")
+                assert False, f"expected {fn} to reject a single argument"
+            except Exception as e:
+                assert "requires 4 arguments" in str(e), str(e)
