@@ -136,6 +136,25 @@ impl SQLContext {
                 self.dynamic_options.clone(),
             )),
         );
+        // Register the built-in table-valued functions against this catalog so
+        // they are usable in SQL without any extra registration call.
+        crate::vector_search::register_vector_search(&self.ctx, catalog.clone(), default_db);
+        #[cfg(feature = "fulltext")]
+        crate::full_text_search::register_full_text_search(
+            &self.ctx,
+            catalog.clone(),
+            default_db,
+        );
+        crate::referenced_files_size::register_referenced_files_size(
+            &self.ctx,
+            catalog.clone(),
+            default_db,
+        );
+        crate::physical_files_size::register_physical_files_size(
+            &self.ctx,
+            catalog.clone(),
+            default_db,
+        );
         self.catalogs.insert(catalog_name.clone(), catalog);
         if is_first {
             self.set_current_catalog(catalog_name).await?;
@@ -1220,12 +1239,7 @@ impl SQLContext {
             .clone()
     }
 
-    /// Returns the Paimon catalog currently set as default.
-    ///
-    /// Exposed so callers that need the registered [`Catalog`] (for example to
-    /// register a table-valued function against it) can retrieve it without
-    /// keeping a duplicate handle of their own.
-    pub fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
+    fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
         let name = self.current_catalog_name();
         self.catalogs.get(&name).cloned().ok_or_else(|| {
             DataFusionError::Plan(

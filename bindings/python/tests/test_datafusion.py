@@ -179,50 +179,21 @@ def test_register_batch_invalid_catalog():
             assert "unknown_catalog" in str(e).lower() or "not a paimon" in str(e).lower() or "unknown" in str(e).lower()
 
 
-def test_register_table_function_vector_search():
+def test_table_functions_registered_with_catalog():
+    """register_catalog auto-registers the built-in table-valued functions, so
+    they are callable in SQL without any extra registration step."""
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.test_db")
+        ctx.sql("CREATE TABLE paimon.test_db.t (id INT, name STRING)")
+        ctx.sql("INSERT INTO paimon.test_db.t VALUES (1, 'alice')")
 
-        # Registering against the current catalog should not raise.
-        ctx.register_table_function("vector_search")
+        referenced = ctx.sql("SELECT * FROM referenced_files_size('test_db.t')")
+        assert pa.Table.from_batches(referenced).num_rows > 0
 
+        physical = ctx.sql("SELECT * FROM physical_files_size('test_db.t')")
+        assert pa.Table.from_batches(physical).num_rows > 0
 
-def test_register_table_function_full_text_search():
-    with tempfile.TemporaryDirectory() as warehouse:
-        ctx = SQLContext()
-        ctx.register_catalog("paimon", {"warehouse": warehouse})
-
-        ctx.register_table_function("full_text_search")
-
-
-def test_register_table_function_with_default_database():
-    with tempfile.TemporaryDirectory() as warehouse:
-        ctx = SQLContext()
-        ctx.register_catalog("paimon", {"warehouse": warehouse})
-
-        # The optional default_database keyword is accepted.
-        ctx.register_table_function("vector_search", default_database="default")
-
-
-def test_register_table_function_unknown_name():
-    with tempfile.TemporaryDirectory() as warehouse:
-        ctx = SQLContext()
-        ctx.register_catalog("paimon", {"warehouse": warehouse})
-
-        try:
-            ctx.register_table_function("does_not_exist")
-            assert False, "Expected an error for an unknown table function"
-        except Exception as e:
-            assert "unknown table function" in str(e).lower()
-            assert "does_not_exist" in str(e)
-
-
-def test_register_table_function_without_catalog():
-    # With no catalog registered there is no current catalog to bind to.
-    ctx = SQLContext()
-    try:
-        ctx.register_table_function("vector_search")
-        assert False, "Expected an error when no catalog is registered"
-    except Exception as e:
-        assert "catalog" in str(e).lower()
+        ctx.sql("DROP TABLE paimon.test_db.t")
+        ctx.sql("DROP SCHEMA paimon.test_db")
