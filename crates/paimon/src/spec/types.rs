@@ -2265,7 +2265,7 @@ mod tests {
             .parse::<i32>()
             .expect("VARCHAR length must parse as Java int");
 
-        let varbinary = VarBinaryType::with_nullable(true, VarBinaryType::MAX_LENGTH)
+        let varbinary = VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH)
             .unwrap()
             .to_string();
         let length_token = varbinary
