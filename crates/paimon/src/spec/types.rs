@@ -1235,7 +1235,9 @@ impl FromStr for VarBinaryType {
 impl VarBinaryType {
     pub const MIN_LENGTH: u32 = 1;
 
-    pub const MAX_LENGTH: u32 = isize::MAX as u32;
+    // Aligned with Java `VarBinaryType.MAX_LENGTH = Integer.MAX_VALUE`; see
+    // `VarCharType::MAX_LENGTH` for the parser overflow this avoids.
+    pub const MAX_LENGTH: u32 = i32::MAX as u32;
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
@@ -1329,7 +1331,11 @@ impl FromStr for VarCharType {
 impl VarCharType {
     pub const MIN_LENGTH: u32 = 1;
 
-    pub const MAX_LENGTH: u32 = isize::MAX as u32;
+    // Aligned with Java `VarCharType.MAX_LENGTH = Integer.MAX_VALUE`. Casting
+    // `isize::MAX` here overflows on 64-bit targets and produces `u32::MAX`
+    // (4294967295), which Java's `DataTypeJsonParser` then fails to parse via
+    // `Integer.parseInt` when reading a `CreateTableRequest`.
+    pub const MAX_LENGTH: u32 = i32::MAX as u32;
 
     pub const DEFAULT_LENGTH: u32 = 1;
 
@@ -2238,5 +2244,36 @@ mod tests {
 
             assert_eq!(actual, expect, "test data type deserialize for {name}")
         }
+    }
+
+    /// Regression: `MAX_LENGTH` for `VarCharType`/`VarBinaryType` must fit in a
+    /// Java `int`, otherwise `DataTypeJsonParser` rejects the `CreateTableRequest`
+    /// REST payload with `NumberFormatException` on `Integer.parseInt`.
+    #[test]
+    fn test_max_length_fits_java_integer() {
+        const JAVA_INTEGER_MAX_VALUE: u32 = i32::MAX as u32;
+
+        assert_eq!(VarCharType::MAX_LENGTH, JAVA_INTEGER_MAX_VALUE);
+        assert_eq!(VarBinaryType::MAX_LENGTH, JAVA_INTEGER_MAX_VALUE);
+
+        let varchar = VarCharType::string_type().to_string();
+        let length_token = varchar
+            .strip_prefix("VARCHAR(")
+            .and_then(|s| s.split(')').next())
+            .expect("VARCHAR display format");
+        length_token
+            .parse::<i32>()
+            .expect("VARCHAR length must parse as Java int");
+
+        let varbinary = VarBinaryType::with_nullable(true, VarBinaryType::MAX_LENGTH)
+            .unwrap()
+            .to_string();
+        let length_token = varbinary
+            .strip_prefix("VARBINARY(")
+            .and_then(|s| s.split(')').next())
+            .expect("VARBINARY display format");
+        length_token
+            .parse::<i32>()
+            .expect("VARBINARY length must parse as Java int");
     }
 }
