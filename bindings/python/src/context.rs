@@ -184,19 +184,41 @@ impl PySQLContext {
         Ok(ctx)
     }
 
+    /// Registers a Paimon catalog under the given name.
+    ///
+    /// `default_database` controls the implicit default-database initialization on the
+    /// underlying [`SQLContext::register_catalog_with_default_db`]:
+    /// - omitted / `None` — keep the historical behavior: probe `"default"` and create it
+    ///   if missing, then `set_current_database("default")` on the first catalog. Requires
+    ///   the principal to have DESCRIBE / CREATEDATABASE on `default`.
+    /// - `Some(name)` — same flow but against the named database.
+    /// - `Some("")` — skip default-database init entirely. Use this when running as a
+    ///   non-admin principal that lacks DESCRIBE on `default`; callers are expected to use
+    ///   fully-qualified table names or call `set_current_database` explicitly later.
+    #[pyo3(signature = (catalog_name, catalog_options, default_database=None))]
     fn register_catalog(
         &mut self,
         py: Python<'_>,
         catalog_name: String,
         catalog_options: HashMap<String, String>,
+        default_database: Option<String>,
     ) -> PyResult<()> {
         let rt = runtime();
         py.detach(|| {
             rt.block_on(async {
                 let options = Options::from_map(catalog_options);
                 let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
+                // Convention: Some("") at the Python layer = caller wants to skip default-db
+                // init. Map empty string to None so the Rust layer's "None means skip" path
+                // fires. Some("name") and the default (None at the Python layer, which we
+                // translate to Some("default")) both go through register_catalog_with_default_db.
+                let default_db: Option<String> = match default_database {
+                    None => Some("default".to_string()),
+                    Some(s) if s.is_empty() => None,
+                    Some(s) => Some(s),
+                };
                 self.inner
-                    .register_catalog(catalog_name, catalog)
+                    .register_catalog_with_default_db(catalog_name, catalog, default_db.as_deref())
                     .await
                     .map_err(df_to_py_err)
             })

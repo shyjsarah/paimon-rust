@@ -117,23 +117,55 @@ impl SQLContext {
     /// for both Paimon-handled SQL and DataFusion-delegated SQL (SELECT, etc.).
     /// A "default" database is created if it does not already exist (matching
     /// the behavior of Spark/Flink Paimon catalogs).
+    ///
+    /// For callers running as a non-admin principal that lacks `CREATEDATABASE`
+    /// / `DESCRIBE` on `default`, use [`Self::register_catalog_with_default_db`]
+    /// with `None` to skip the default-database initialization entirely, or with
+    /// `Some(name)` to point at a database the principal does have access to.
     pub async fn register_catalog(
         &mut self,
         catalog_name: impl Into<String>,
         catalog: Arc<dyn Catalog>,
     ) -> DFResult<()> {
+        self.register_catalog_with_default_db(catalog_name, catalog, Some("default"))
+            .await
+    }
+
+    /// Registers a Paimon catalog under the given name, with caller-controlled
+    /// default-database initialization.
+    ///
+    /// `default_db`:
+    /// - `Some(name)` — ensure the named database exists (create if missing). The first
+    ///   registered catalog also gets `set_current_database(name)`. Mirrors the behavior
+    ///   of Java `FlinkCatalog`'s `defaultDatabase` constructor parameter.
+    /// - `None` — skip the default-database probe and create entirely, and skip the
+    ///   implicit `set_current_database`. Mirrors Java `FlinkCatalog`'s
+    ///   `DISABLE_CREATE_TABLE_IN_DEFAULT_DB=true` option. Required for non-admin
+    ///   principals that lack DESCRIBE / CREATEDATABASE on `default` — without this they
+    ///   hit a `Forbidden: ... DESCRIBE on DATABASE default` failure at session init even
+    ///   when their actual queries target databases they do have access to. Such callers
+    ///   are expected to set the current database themselves via
+    ///   [`Self::set_current_database`] after registration, or to use fully-qualified
+    ///   table names in every query.
+    pub async fn register_catalog_with_default_db(
+        &mut self,
+        catalog_name: impl Into<String>,
+        catalog: Arc<dyn Catalog>,
+        default_db: Option<&str>,
+    ) -> DFResult<()> {
         let catalog_name = catalog_name.into();
         let is_first = self.catalogs.is_empty();
-        let default_db = "default";
-        match catalog.get_database(default_db).await {
-            Ok(_) => {}
-            Err(paimon::Error::DatabaseNotExist { .. }) => {
-                catalog
-                    .create_database(default_db, true, Default::default())
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let Some(default_db) = default_db {
+            match catalog.get_database(default_db).await {
+                Ok(_) => {}
+                Err(paimon::Error::DatabaseNotExist { .. }) => {
+                    catalog
+                        .create_database(default_db, true, Default::default())
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                }
+                Err(e) => return Err(DataFusionError::External(Box::new(e))),
             }
-            Err(e) => return Err(DataFusionError::External(Box::new(e))),
         }
         self.ctx.register_catalog(
             &catalog_name,
@@ -143,11 +175,16 @@ impl SQLContext {
                 self.blob_reader_registry.clone(),
             )),
         );
-        register_table_functions(&self.ctx, &catalog, default_db);
+        // Built-in table functions carry a default database for namespacing only — this is a
+        // string passed into the function registry, not a remote probe. When the caller opts
+        // out of default-db init we fall back to the literal "default" here.
+        register_table_functions(&self.ctx, &catalog, default_db.unwrap_or("default"));
         self.catalogs.insert(catalog_name.clone(), catalog);
         if is_first {
             self.set_current_catalog(catalog_name).await?;
-            self.set_current_database(default_db).await?;
+            if let Some(default_db) = default_db {
+                self.set_current_database(default_db).await?;
+            }
         }
         Ok(())
     }
