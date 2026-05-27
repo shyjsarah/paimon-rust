@@ -2485,6 +2485,152 @@ mod tests {
         ctx
     }
 
+    // ==================== register_catalog_with_default_db tests ====================
+
+    /// Counts get/create_database calls so tests can assert whether the default-db
+    /// init path fired. `get_database` returns `Unsupported` rather than
+    /// `DatabaseNotExist` so that *not* skipping the probe surfaces as a hard error
+    /// (mimics a "Forbidden: DESCRIBE on DATABASE default" failure).
+    struct ProbeTrackingCatalog {
+        get_calls: std::sync::atomic::AtomicUsize,
+        create_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProbeTrackingCatalog {
+        fn new() -> Self {
+            Self {
+                get_calls: std::sync::atomic::AtomicUsize::new(0),
+                create_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn get_count(&self) -> usize {
+            self.get_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn create_count(&self) -> usize {
+            self.create_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Catalog for ProbeTrackingCatalog {
+        async fn list_databases(&self) -> paimon::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn create_database(
+            &self,
+            _name: &str,
+            _ignore_if_exists: bool,
+            _properties: HashMap<String, String>,
+        ) -> paimon::Result<()> {
+            self.create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn get_database(&self, _name: &str) -> paimon::Result<Database> {
+            self.get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(paimon::Error::Unsupported {
+                message: "simulated Forbidden".to_string(),
+            })
+        }
+        async fn drop_database(
+            &self,
+            _name: &str,
+            _ignore_if_not_exists: bool,
+            _cascade: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn get_table(&self, identifier: &Identifier) -> paimon::Result<Table> {
+            Err(paimon::Error::TableNotExist {
+                full_name: identifier.to_string(),
+            })
+        }
+        async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn create_table(
+            &self,
+            _identifier: &Identifier,
+            _creation: PaimonSchema,
+            _ignore_if_exists: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn drop_table(
+            &self,
+            _identifier: &Identifier,
+            _ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn rename_table(
+            &self,
+            _from: &Identifier,
+            _to: &Identifier,
+            _ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+        async fn alter_table(
+            &self,
+            _identifier: &Identifier,
+            _changes: Vec<SchemaChange>,
+            _ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn register_catalog_with_none_skips_default_db_probe() {
+        let catalog = Arc::new(ProbeTrackingCatalog::new());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", catalog.clone(), None)
+            .await
+            .expect("None must skip probe so Forbidden-shaped error never fires");
+        assert_eq!(catalog.get_count(), 0, "get_database must not be called");
+        assert_eq!(
+            catalog.create_count(),
+            0,
+            "create_database must not be called"
+        );
+        // Current catalog still set; current database left unchanged.
+        assert_eq!(
+            ctx.ctx().state().config().options().catalog.default_catalog,
+            "paimon"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_catalog_with_some_default_propagates_probe_error() {
+        let catalog = Arc::new(ProbeTrackingCatalog::new());
+        let mut ctx = SQLContext::new();
+        let err = ctx
+            .register_catalog_with_default_db("paimon", catalog.clone(), Some("default"))
+            .await
+            .expect_err("non-DatabaseNotExist error from get_database must propagate");
+        assert!(
+            err.to_string().contains("simulated Forbidden"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(catalog.get_count(), 1);
+        assert_eq!(catalog.create_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_catalog_default_wrapper_uses_default_db() {
+        // The bare register_catalog() must delegate with Some("default"), so the
+        // probe fires and Forbidden propagates — same as Some("default") above.
+        let catalog = Arc::new(ProbeTrackingCatalog::new());
+        let mut ctx = SQLContext::new();
+        assert!(ctx
+            .register_catalog("paimon", catalog.clone())
+            .await
+            .is_err());
+        assert_eq!(catalog.get_count(), 1);
+    }
+
     fn assert_sql_type_to_paimon(
         sql_type: datafusion::sql::sqlparser::ast::DataType,
         expected: PaimonDataType,
