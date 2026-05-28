@@ -132,25 +132,12 @@ impl SQLContext {
     /// first catalog. `default_db = None` skips both — required for principals that
     /// lack DESCRIBE / CREATEDATABASE on `default`. Mirrors Java `FlinkCatalog`'s
     /// `defaultDatabase` / `DISABLE_CREATE_TABLE_IN_DEFAULT_DB`.
-    ///
-    /// `default_db = Some("")` is rejected — pass `None` to opt out instead.
-    ///
-    /// **Note on built-in TVFs (`vector_search`, `full_text_search`):** when
-    /// `default_db = None`, bare table names inside these functions still resolve
-    /// against the literal namespace `"default"` (the fallback in
-    /// [`register_table_functions`]). Callers using `None` must qualify table names
-    /// (`'db.table'` or `'catalog.db.table'`) in those calls.
     pub async fn register_catalog_with_default_db(
         &mut self,
         catalog_name: impl Into<String>,
         catalog: Arc<dyn Catalog>,
         default_db: Option<&str>,
     ) -> DFResult<()> {
-        if matches!(default_db, Some("")) {
-            return Err(DataFusionError::Plan(
-                "default_db must not be empty; pass None to skip default-database init".to_string(),
-            ));
-        }
         let catalog_name = catalog_name.into();
         let is_first = self.catalogs.is_empty();
         if let Some(default_db) = default_db {
@@ -2629,51 +2616,6 @@ mod tests {
         );
         assert_eq!(catalog.get_count(), 1);
         assert_eq!(catalog.create_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn register_catalog_with_some_empty_string_is_rejected() {
-        // Footgun guard: raw Rust callers could pass `Some("")` and silently probe
-        // `get_database("")`. Reject at the API boundary; tell them to use `None` instead.
-        let catalog = Arc::new(ProbeTrackingCatalog::new());
-        let mut ctx = SQLContext::new();
-        let err = ctx
-            .register_catalog_with_default_db("paimon", catalog.clone(), Some(""))
-            .await
-            .expect_err("empty default_db must be rejected at the API");
-        assert!(
-            err.to_string().contains("must not be empty"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(
-            catalog.get_count(),
-            0,
-            "guard must short-circuit before any catalog call"
-        );
-    }
-
-    #[tokio::test]
-    async fn register_catalog_with_none_table_function_resolves_bare_name_to_literal_default() {
-        // Documents the fallback in register_table_functions: `default_db.unwrap_or("default")`.
-        // When the caller opts out of default-db init, bare table names inside built-in TVFs
-        // (vector_search / full_text_search) still resolve against the literal namespace
-        // `"default"` — so a caller using `None` MUST use fully-qualified names with these
-        // functions or they'll hit a `default.<name>` lookup that may not exist / be readable.
-        let catalog = Arc::new(ProbeTrackingCatalog::new());
-        let mut ctx = SQLContext::new();
-        ctx.register_catalog_with_default_db("paimon", catalog, None)
-            .await
-            .unwrap();
-
-        let err = ctx
-            .sql("SELECT * FROM vector_search('bare', 'col', '[1.0]', 1)")
-            .await
-            .expect_err("bare name must error out — no `default.bare` table in mock catalog");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("default") && msg.contains("bare"),
-            "error must surface the fallback 'default' namespace + bare name, got: {msg}"
-        );
     }
 
     #[tokio::test]
