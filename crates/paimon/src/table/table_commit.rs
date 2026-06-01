@@ -918,7 +918,7 @@ impl TableCommit {
         let num_fields = partition_fields.len();
 
         if num_fields == 0 || entries.is_empty() {
-            return Ok(BinaryTableStats::new(vec![], vec![], vec![]));
+            return Ok(BinaryTableStats::empty());
         }
 
         let data_types: Vec<_> = partition_fields
@@ -1220,8 +1220,8 @@ mod tests {
             row_count,
             min_key: vec![],
             max_key: vec![],
-            key_stats: BinaryTableStats::new(vec![], vec![], vec![]),
-            value_stats: BinaryTableStats::new(vec![], vec![], vec![]),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
             min_sequence_number: 0,
             max_sequence_number: 0,
             schema_id: 0,
@@ -1821,5 +1821,44 @@ mod tests {
             err_msg.contains("Delete conflict"),
             "Expected 'Delete conflict' error, got: {err_msg}"
         );
+    }
+
+    /// Regression: a non-partitioned table (e.g. `CREATE TABLE test_pk (... PRIMARY KEY ...)`)
+    /// must still emit `_PARTITION_STATS._MIN_VALUES`/`_MAX_VALUES` carrying the 4-byte BE
+    /// arity prefix; otherwise Java readers like Spark/Flink hit
+    /// `BufferUnderflowException` inside `SerializationUtils.deserializeBinaryRow`.
+    #[test]
+    fn compute_partition_stats_no_partition_fields_returns_decodable_empty() {
+        let file_io = test_file_io();
+        let commit = setup_commit(&file_io, "memory:/test_no_partition_stats");
+
+        let entry = ManifestEntry::new(
+            FileKind::Add,
+            vec![],
+            0,
+            1,
+            test_data_file("data-0.parquet", 1),
+            2,
+        );
+
+        let stats = commit.compute_partition_stats(&[entry]).unwrap();
+        BinaryRow::from_serialized_bytes(stats.min_values())
+            .expect("min_values must decode via the same protocol as Java's deserializeBinaryRow");
+        BinaryRow::from_serialized_bytes(stats.max_values())
+            .expect("max_values must decode via the same protocol as Java's deserializeBinaryRow");
+        assert!(stats.null_counts().is_empty());
+    }
+
+    /// Regression: when there are no entries at all, the empty stats we return must also
+    /// satisfy the protocol — same Java reader path runs on it.
+    #[test]
+    fn compute_partition_stats_empty_entries_returns_decodable_empty() {
+        let file_io = test_file_io();
+        let commit = setup_partitioned_commit(&file_io, "memory:/test_no_entries_stats");
+
+        let stats = commit.compute_partition_stats(&[]).unwrap();
+        BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert!(stats.null_counts().is_empty());
     }
 }
