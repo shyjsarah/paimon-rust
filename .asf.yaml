@@ -37,10 +37,23 @@ github:
     discussions: true
     wiki: false
     projects: false
-  protected_branches: ~
+  protected_branches:
   collaborators:
     - Xuanwo
 
+  rulesets:
+    - name: "Default Branch Protection"
+      type: branch
+      branches:
+        includes:
+          - "~DEFAULT_BRANCH"
+          - "release/*"
+          - "rel/*"
+        excludes: []
+      bypass_teams:
+        - root
+      restrict_deletion: true
+      restrict_force_push: true
 notifications:
   commits: commits@paimon.apache.org
   issues: issues@paimon.apache.org

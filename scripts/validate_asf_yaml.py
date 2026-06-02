@@ -43,6 +43,7 @@ VALID_GITHUB_KEYS = {
     "features",
     "enabled_merge_buttons",
     "protected_branches",
+    "rulesets",
     "collaborators",
     "autolinks",
     "environments",
