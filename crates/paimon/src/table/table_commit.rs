@@ -956,13 +956,6 @@ impl TableCommit {
             }
         }
 
-        // Always emit a serialized BinaryRow whose arity matches the partition schema —
-        // even when every collected min/max is None (the partition has only null values).
-        // `datums_to_binary_row` collapses that case to `vec![]` for use as a "no partition
-        // columns" sentinel elsewhere; here that sentinel would make Java's reader hit
-        // `BufferUnderflowException` inside `SerializationUtils.deserializeBinaryRow`
-        // because `null_counts` is non-empty and so `SimpleStats.fromRow` no longer
-        // short-circuits to `EMPTY_STATS`.
         let min_bytes = build_partition_stats_row(&mins, &data_types);
         let max_bytes = build_partition_stats_row(&maxs, &data_types);
         let null_counts = null_counts.into_iter().map(Some).collect();
@@ -1117,16 +1110,9 @@ impl TableCommit {
     }
 }
 
-/// Build a serialized BinaryRow for partition min/max stats with `datums.len()` arity,
-/// setting the null bit for every position whose datum is `None`. Mirrors what Java does
-/// in `SimpleStatsConverter.toBinaryAllMode` for non-zero arity — always a decodable row,
-/// never an empty `Vec`.
-///
-/// We deliberately do not reuse `spec::datums_to_binary_row` here: that helper collapses an
-/// all-None input to `vec![]`, which is a valid "no partition columns" sentinel for
-/// `partitions_to_bytes` but a protocol violation when stuffed into `BinaryTableStats`
-/// alongside a non-empty `null_counts` (Java's `SimpleStats.fromRow` cannot short-circuit
-/// to `EMPTY_STATS` and crashes inside `SerializationUtils.deserializeBinaryRow`).
+/// Serialized BinaryRow for partition stats; unlike `datums_to_binary_row`, returns a
+/// valid arity-N row even when every datum is `None` (the all-null case must still
+/// decode on the Java side).
 fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) -> Vec<u8> {
     let mut builder = BinaryRowBuilder::new(datums.len() as i32);
     for (pos, (datum_opt, data_type)) in datums.iter().zip(data_types.iter()).enumerate() {
@@ -1887,19 +1873,13 @@ mod tests {
         assert!(stats.null_counts().is_empty());
     }
 
-    /// Regression: a partitioned table whose committed entries carry an all-null
-    /// partition row (every partition column is NULL) must still emit decodable
-    /// min/max BinaryRow bytes. The previous implementation routed through
-    /// `datums_to_binary_row`, which returns `Vec::new()` when every collected datum
-    /// is `None`; combined with a non-empty `null_counts`, `SimpleStats.fromRow`
-    /// cannot short-circuit to `EMPTY_STATS` and Spark / Flink hit
-    /// `BufferUnderflowException` on `getBinary(0).getInt()`.
+    /// Regression: partitioned table with an all-null partition row must still emit
+    /// decodable min/max bytes (otherwise Java hits `BufferUnderflowException`).
     #[test]
     fn compute_partition_stats_all_null_partition_values_returns_decodable_bytes() {
         let file_io = test_file_io();
         let commit = setup_partitioned_commit(&file_io, "memory:/test_all_null_partition_stats");
 
-        // A valid arity-1 BinaryRow with the lone partition column set to NULL.
         let mut builder = BinaryRowBuilder::new(1);
         builder.set_null_at(0);
         let null_partition = builder.build_serialized();
@@ -1914,32 +1894,12 @@ mod tests {
         );
 
         let stats = commit.compute_partition_stats(&[entry]).unwrap();
-        let min_row = BinaryRow::from_serialized_bytes(stats.min_values())
-            .expect("min_values must decode as a BinaryRow for the Java reader");
-        let max_row = BinaryRow::from_serialized_bytes(stats.max_values())
-            .expect("max_values must decode as a BinaryRow for the Java reader");
-        assert_eq!(
-            min_row.arity(),
-            1,
-            "min row arity must match the partition schema"
-        );
-        assert_eq!(
-            max_row.arity(),
-            1,
-            "max row arity must match the partition schema"
-        );
-        assert!(
-            min_row.is_null_at(0),
-            "min value must be NULL since the only input was NULL"
-        );
-        assert!(
-            max_row.is_null_at(0),
-            "max value must be NULL since the only input was NULL"
-        );
-        assert_eq!(
-            stats.null_counts(),
-            &vec![Some(1)],
-            "the single all-null entry should be counted",
-        );
+        let min_row = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        let max_row = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert_eq!(min_row.arity(), 1);
+        assert_eq!(max_row.arity(), 1);
+        assert!(min_row.is_null_at(0));
+        assert!(max_row.is_null_at(0));
+        assert_eq!(stats.null_counts(), &vec![Some(1)]);
     }
 }
