@@ -192,7 +192,7 @@ fn data_type_to_sql(data_type: &DataType) -> String {
         }
         DataType::Array(t) => format!("ARRAY<{}>", data_type_to_sql(t.element_type())),
         DataType::Map(t) => format!(
-            "MAP<{}, {}>",
+            "MAP({}, {})",
             data_type_to_sql(t.key_type()),
             data_type_to_sql(t.value_type())
         ),
