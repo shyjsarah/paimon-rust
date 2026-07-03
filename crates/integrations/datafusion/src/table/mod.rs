@@ -201,9 +201,16 @@ fn data_type_to_sql(data_type: &DataType) -> String {
             let inner: Vec<String> = t
                 .fields()
                 .iter()
-                .map(|f| format!("{}: {}", f.name(), data_type_to_sql(f.data_type())))
+                .map(|f| {
+                    let ty = data_type_to_sql(f.data_type());
+                    if f.name().is_empty() {
+                        ty
+                    } else {
+                        format!("{} {}", f.name(), ty)
+                    }
+                })
                 .collect();
-            format!("ROW<{}>", inner.join(", "))
+            format!("STRUCT<{}>", inner.join(", "))
         }
         DataType::Vector(t) => format!(
             "VECTOR<{}, {}>",
