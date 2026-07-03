@@ -1266,10 +1266,7 @@ async fn test_multiple_temporary_views_in_same_database() {
 // ======================= SHOW CREATE TABLE =======================
 
 /// Collect the `definition` column from `SHOW CREATE TABLE` output as a String.
-async fn collect_definition(
-    sql_context: &SQLContext,
-    table_ref: &str,
-) -> String {
+async fn collect_definition(sql_context: &SQLContext, table_ref: &str) -> String {
     let rows = sql_context
         .sql(&format!("SHOW CREATE TABLE {}", table_ref))
         .await
@@ -1425,4 +1422,3 @@ async fn test_show_create_table_various_types() {
         );
     }
 }
-

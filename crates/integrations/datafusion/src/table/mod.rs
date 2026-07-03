@@ -202,7 +202,11 @@ fn data_type_to_sql(data_type: &DataType) -> String {
                 .collect();
             format!("ROW<{}>", inner.join(", "))
         }
-        DataType::Vector(t) => format!("VECTOR<{}, {}>", data_type_to_sql(t.element_type()), t.length()),
+        DataType::Vector(t) => format!(
+            "VECTOR<{}, {}>",
+            data_type_to_sql(t.element_type()),
+            t.length()
+        ),
     }
 }
 
