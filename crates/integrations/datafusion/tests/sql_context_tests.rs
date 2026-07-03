@@ -1422,3 +1422,123 @@ async fn test_show_create_table_various_types() {
         );
     }
 }
+
+/// Assert that two `TableSchema`s are equivalent for round-trip purposes:
+/// same fields (id, name, type), same primary keys, same partition keys.
+///
+/// We do not compare `options` because the CREATE TABLE path may inject
+/// catalog defaults (e.g. `bucket`) that the user did not specify; the
+/// schema fields and key columns are what the DDL must preserve.
+fn assert_schema_equivalent(left: &paimon::spec::TableSchema, right: &paimon::spec::TableSchema) {
+    assert_eq!(
+        left.fields().len(),
+        right.fields().len(),
+        "field count mismatch\nleft  (original): {:?}\nright (recreated): {:?}",
+        left.fields(),
+        right.fields()
+    );
+    for (lf, rf) in left.fields().iter().zip(right.fields().iter()) {
+        assert_eq!(
+            lf.id(),
+            rf.id(),
+            "field id mismatch for `{}`: {} vs {}",
+            lf.name(),
+            lf.id(),
+            rf.id()
+        );
+        assert_eq!(
+            lf.name(),
+            rf.name(),
+            "field name mismatch: `{}` vs `{}`",
+            lf.name(),
+            rf.name()
+        );
+        assert_eq!(
+            lf.data_type(),
+            rf.data_type(),
+            "field type mismatch for `{}`: {:?} vs {:?}",
+            lf.name(),
+            lf.data_type(),
+            rf.data_type()
+        );
+    }
+    assert_eq!(
+        left.primary_keys(),
+        right.primary_keys(),
+        "primary keys mismatch: {:?} vs {:?}",
+        left.primary_keys(),
+        right.primary_keys()
+    );
+    assert_eq!(
+        left.partition_keys(),
+        right.partition_keys(),
+        "partition keys mismatch: {:?} vs {:?}",
+        left.partition_keys(),
+        right.partition_keys()
+    );
+}
+
+/// Round-trip test: the DDL returned by `SHOW CREATE TABLE` must be executable
+/// by paimon-rust's own `CREATE TABLE` parser and reproduce an equivalent
+/// schema (fields, primary keys, partition keys).
+///
+/// This guards against regressions where the rendered DDL drifts away from
+/// what the parser accepts (e.g. `ROW<name: type>` vs `STRUCT<name type>`,
+/// `MAP<k: v>` vs `MAP(k, v)`, or dropped `NOT NULL`).
+#[tokio::test]
+async fn test_show_create_table_round_trip() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t1 (\
+             id INT NOT NULL, \
+             name VARCHAR NOT NULL, \
+             tags ARRAY<STRING>, \
+             props MAP(INT, VARCHAR), \
+             addr STRUCT<city VARCHAR, zip VARCHAR>, \
+             meta STRUCT<kv MAP(STRING, STRING), tags ARRAY<INT>>, \
+             PRIMARY KEY (id)) \
+             PARTITIONED BY (name) \
+             WITH ('bucket' = '2', 'file.format' = 'parquet')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    let identifier = Identifier::new("test_db", "t1");
+    let original = catalog.get_table(&identifier).await.expect("table exists");
+    let original_schema = original.schema().clone();
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t1").await;
+    // The DDL is rendered as `CREATE TABLE test_db.t1 (...)` without the
+    // catalog prefix; paimon is the default catalog so this resolves back
+    // to the same catalog/database.
+    assert!(
+        definition.starts_with("CREATE TABLE test_db.t1"),
+        "definition should start with `CREATE TABLE test_db.t1`, got: {definition}"
+    );
+
+    catalog
+        .drop_table(&identifier, false)
+        .await
+        .expect("drop should succeed");
+
+    sql_context
+        .sql(&definition)
+        .await
+        .expect("DDL should re-execute")
+        .collect()
+        .await
+        .expect("DDL should execute");
+
+    let recreated = catalog
+        .get_table(&identifier)
+        .await
+        .expect("recreated table exists");
+    assert_schema_equivalent(&original_schema, recreated.schema());
+}
