@@ -18,6 +18,7 @@
 //! Paimon table provider for DataFusion.
 
 use std::any::Any;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use paimon::spec::DataType;
 use paimon::table::Table;
 
 use crate::physical_plan::PaimonDataSink;
@@ -54,6 +56,7 @@ use crate::runtime::await_with_runtime;
 pub struct PaimonTableProvider {
     table: Table,
     schema: ArrowSchemaRef,
+    table_definition: String,
 }
 
 impl PaimonTableProvider {
@@ -72,7 +75,12 @@ impl PaimonTableProvider {
         }
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
-        Ok(Self { table, schema })
+        let table_definition = build_table_definition(&table);
+        Ok(Self {
+            table,
+            schema,
+            table_definition,
+        })
     }
 
     pub fn try_new_with_blob_reader_registry(
@@ -86,6 +94,115 @@ impl PaimonTableProvider {
 
     pub fn table(&self) -> &Table {
         &self.table
+    }
+}
+
+/// Build a `CREATE TABLE` DDL string for a Paimon table.
+///
+/// Mirrors the syntax accepted by `SQLContext::handle_create_table`:
+/// `CREATE TABLE <db>.<table> (<col> <type>, ..., PRIMARY KEY (...)) [PARTITIONED BY (...)] [WITH ('k'='v', ...)]`.
+fn build_table_definition(table: &Table) -> String {
+    let identifier = table.identifier();
+    let schema = table.schema();
+    let mut ddl = String::new();
+    let _ = write!(
+        ddl,
+        "CREATE TABLE {}.{} (",
+        identifier.database(),
+        identifier.object()
+    );
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        if i > 0 {
+            ddl.push_str(", ");
+        }
+        let _ = write!(
+            ddl,
+            "{} {}",
+            field.name(),
+            data_type_to_sql(field.data_type())
+        );
+    }
+
+    let pks = schema.primary_keys();
+    if !pks.is_empty() {
+        ddl.push_str(", PRIMARY KEY (");
+        for (i, pk) in pks.iter().enumerate() {
+            if i > 0 {
+                ddl.push_str(", ");
+            }
+            let _ = write!(ddl, "{}", pk);
+        }
+        ddl.push(')');
+    }
+    ddl.push(')');
+
+    let partition_keys = schema.partition_keys();
+    if !partition_keys.is_empty() {
+        ddl.push_str(" PARTITIONED BY (");
+        for (i, pk) in partition_keys.iter().enumerate() {
+            if i > 0 {
+                ddl.push_str(", ");
+            }
+            let _ = write!(ddl, "{}", pk);
+        }
+        ddl.push(')');
+    }
+
+    let options = schema.options();
+    if !options.is_empty() {
+        ddl.push_str(" WITH (");
+        for (i, (k, v)) in options.iter().enumerate() {
+            if i > 0 {
+                ddl.push_str(", ");
+            }
+            let _ = write!(ddl, "'{}' = '{}'", k, v);
+        }
+        ddl.push(')');
+    }
+
+    ddl
+}
+
+/// Render a Paimon [`DataType`] as a SQL type string matching the syntax
+/// accepted by paimon-rust's `CREATE TABLE` parser.
+fn data_type_to_sql(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Boolean(_) => "BOOLEAN".to_string(),
+        DataType::TinyInt(_) => "TINYINT".to_string(),
+        DataType::SmallInt(_) => "SMALLINT".to_string(),
+        DataType::Int(_) => "INT".to_string(),
+        DataType::BigInt(_) => "BIGINT".to_string(),
+        DataType::Decimal(t) => format!("DECIMAL({}, {})", t.precision(), t.scale()),
+        DataType::Double(_) => "DOUBLE".to_string(),
+        DataType::Float(_) => "FLOAT".to_string(),
+        DataType::Binary(t) => format!("BINARY({})", t.length()),
+        DataType::VarBinary(t) => format!("VARBINARY({})", t.length()),
+        DataType::Blob(_) => "BLOB".to_string(),
+        DataType::Char(t) => format!("CHAR({})", t.length()),
+        DataType::VarChar(t) => format!("VARCHAR({})", t.length()),
+        DataType::Date(_) => "DATE".to_string(),
+        DataType::Time(t) => format!("TIME({})", t.precision()),
+        DataType::Timestamp(t) => format!("TIMESTAMP({})", t.precision()),
+        DataType::LocalZonedTimestamp(t) => {
+            format!("TIMESTAMP_LTZ({})", t.precision())
+        }
+        DataType::Array(t) => format!("ARRAY<{}>", data_type_to_sql(t.element_type())),
+        DataType::Map(t) => format!(
+            "MAP<{}, {}>",
+            data_type_to_sql(t.key_type()),
+            data_type_to_sql(t.value_type())
+        ),
+        DataType::Multiset(t) => format!("MULTISET<{}>", data_type_to_sql(t.element_type())),
+        DataType::Row(t) => {
+            let inner: Vec<String> = t
+                .fields()
+                .iter()
+                .map(|f| format!("{}: {}", f.name(), data_type_to_sql(f.data_type())))
+                .collect();
+            format!("ROW<{}>", inner.join(", "))
+        }
+        DataType::Vector(t) => format!("VECTOR<{}, {}>", data_type_to_sql(t.element_type()), t.length()),
     }
 }
 
@@ -165,6 +282,10 @@ impl TableProvider for PaimonTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        Some(&self.table_definition)
     }
 
     async fn scan(

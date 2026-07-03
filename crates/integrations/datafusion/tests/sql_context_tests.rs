@@ -1262,3 +1262,167 @@ async fn test_multiple_temporary_views_in_same_database() {
         .sum::<usize>();
     assert_eq!(rows2, 3);
 }
+
+// ======================= SHOW CREATE TABLE =======================
+
+/// Collect the `definition` column from `SHOW CREATE TABLE` output as a String.
+async fn collect_definition(
+    sql_context: &SQLContext,
+    table_ref: &str,
+) -> String {
+    let rows = sql_context
+        .sql(&format!("SHOW CREATE TABLE {}", table_ref))
+        .await
+        .expect("SHOW CREATE TABLE should plan")
+        .collect()
+        .await
+        .expect("SHOW CREATE TABLE should execute");
+    assert_eq!(
+        rows.len(),
+        1,
+        "SHOW CREATE TABLE should return exactly one row"
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.num_rows(),
+        1,
+        "SHOW CREATE TABLE should return exactly one row"
+    );
+    let val = row.column(3); // definition is the 4th column
+    let def = val
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringArray>()
+        .expect("definition column should be a StringArray")
+        .value(0);
+    def.to_string()
+}
+
+#[tokio::test]
+async fn test_show_create_table_simple() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR(100))")
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    assert!(
+        definition.contains("CREATE TABLE test_db.t"),
+        "definition should start with CREATE TABLE test_db.t, got: {definition}"
+    );
+    assert!(
+        definition.contains("id INT"),
+        "definition should contain `id INT`, got: {definition}"
+    );
+    assert!(
+        definition.contains("name VARCHAR("),
+        "definition should contain `name VARCHAR(...)`, got: {definition}"
+    );
+}
+
+#[tokio::test]
+async fn test_show_create_table_with_primary_key() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.t (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id))")
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    assert!(
+        definition.contains("PRIMARY KEY (id)"),
+        "definition should contain PRIMARY KEY (id), got: {definition}"
+    );
+}
+
+#[tokio::test]
+async fn test_show_create_table_with_partition_and_options() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) \
+             PARTITIONED BY (pt) WITH ('bucket' = '4', 'file.format' = 'parquet')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    assert!(
+        definition.contains("PARTITIONED BY (pt)"),
+        "definition should contain PARTITIONED BY (pt), got: {definition}"
+    );
+    assert!(
+        definition.contains("'bucket' = '4'"),
+        "definition should contain bucket option, got: {definition}"
+    );
+    assert!(
+        definition.contains("'file.format' = 'parquet'"),
+        "definition should contain file.format option, got: {definition}"
+    );
+}
+
+#[tokio::test]
+async fn test_show_create_table_various_types() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t (\
+             a BOOLEAN, \
+             b TINYINT, \
+             c SMALLINT, \
+             d BIGINT, \
+             e DECIMAL(10, 2), \
+             f DOUBLE, \
+             g FLOAT, \
+             h DATE, \
+             i TIMESTAMP(3), \
+             j BLOB) \
+             WITH ('data-evolution.enabled' = 'true')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    for needle in [
+        "a BOOLEAN",
+        "b TINYINT",
+        "c SMALLINT",
+        "d BIGINT",
+        "e DECIMAL(10, 2)",
+        "f DOUBLE",
+        "g FLOAT",
+        "h DATE",
+        "i TIMESTAMP(3)",
+        "j BLOB",
+    ] {
+        assert!(
+            definition.contains(needle),
+            "definition should contain `{needle}`, got: {definition}"
+        );
+    }
+}
+
