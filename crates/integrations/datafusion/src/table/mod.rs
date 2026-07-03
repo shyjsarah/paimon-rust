@@ -166,8 +166,11 @@ fn build_table_definition(table: &Table) -> String {
 
 /// Render a Paimon [`DataType`] as a SQL type string matching the syntax
 /// accepted by paimon-rust's `CREATE TABLE` parser.
+///
+/// Non-nullable types are suffixed with `NOT NULL` so that the rendered DDL
+/// round-trips back to the same schema.
 fn data_type_to_sql(data_type: &DataType) -> String {
-    match data_type {
+    let base = match data_type {
         DataType::Boolean(_) => "BOOLEAN".to_string(),
         DataType::TinyInt(_) => "TINYINT".to_string(),
         DataType::SmallInt(_) => "SMALLINT".to_string(),
@@ -207,6 +210,11 @@ fn data_type_to_sql(data_type: &DataType) -> String {
             data_type_to_sql(t.element_type()),
             t.length()
         ),
+    };
+    if !data_type.is_nullable() {
+        format!("{base} NOT NULL")
+    } else {
+        base
     }
 }
 
