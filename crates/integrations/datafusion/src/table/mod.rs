@@ -116,12 +116,14 @@ fn build_table_definition(table: &Table) -> String {
         if i > 0 {
             ddl.push_str(", ");
         }
-        let _ = write!(
-            ddl,
-            "{} {}",
-            field.name(),
-            data_type_to_sql(field.data_type())
-        );
+        // `NOT NULL` is a column constraint; render it here at the column
+        // level rather than inside nested type arguments (see `data_type_to_sql`).
+        let ty = data_type_to_sql(field.data_type());
+        if field.data_type().is_nullable() {
+            let _ = write!(ddl, "{} {}", field.name(), ty);
+        } else {
+            let _ = write!(ddl, "{} {} NOT NULL", field.name(), ty);
+        }
     }
 
     let pks = schema.primary_keys();
@@ -167,10 +169,12 @@ fn build_table_definition(table: &Table) -> String {
 /// Render a Paimon [`DataType`] as a SQL type string matching the syntax
 /// accepted by paimon-rust's `CREATE TABLE` parser.
 ///
-/// Non-nullable types are suffixed with `NOT NULL` so that the rendered DDL
-/// round-trips back to the same schema.
+/// `NOT NULL` is a column constraint, not a type modifier — it is only valid
+/// at the top of a column definition, not nested inside `MAP`, `ARRAY`, or
+/// `STRUCT` arguments. Callers that render a column should append `NOT NULL`
+/// themselves when the field is non-nullable; recursive calls below must not.
 fn data_type_to_sql(data_type: &DataType) -> String {
-    let base = match data_type {
+    match data_type {
         DataType::Boolean(_) => "BOOLEAN".to_string(),
         DataType::TinyInt(_) => "TINYINT".to_string(),
         DataType::SmallInt(_) => "SMALLINT".to_string(),
@@ -187,9 +191,7 @@ fn data_type_to_sql(data_type: &DataType) -> String {
         DataType::Date(_) => "DATE".to_string(),
         DataType::Time(t) => format!("TIME({})", t.precision()),
         DataType::Timestamp(t) => format!("TIMESTAMP({})", t.precision()),
-        DataType::LocalZonedTimestamp(t) => {
-            format!("TIMESTAMP_LTZ({})", t.precision())
-        }
+        DataType::LocalZonedTimestamp(t) => format!("TIMESTAMP_LTZ({})", t.precision()),
         DataType::Array(t) => format!("ARRAY<{}>", data_type_to_sql(t.element_type())),
         DataType::Map(t) => format!(
             "MAP({}, {})",
@@ -217,11 +219,6 @@ fn data_type_to_sql(data_type: &DataType) -> String {
             data_type_to_sql(t.element_type()),
             t.length()
         ),
-    };
-    if !data_type.is_nullable() {
-        format!("{base} NOT NULL")
-    } else {
-        base
     }
 }
 
