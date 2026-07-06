@@ -26,7 +26,7 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -75,7 +75,7 @@ impl PaimonTableProvider {
         }
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
-        let table_definition = build_table_definition(&table);
+        let table_definition = build_table_definition(&table)?;
         Ok(Self {
             table,
             schema,
@@ -101,15 +101,15 @@ impl PaimonTableProvider {
 ///
 /// Mirrors the syntax accepted by `SQLContext::handle_create_table`:
 /// `CREATE TABLE <db>.<table> (<col> <type>, ..., PRIMARY KEY (...)) [PARTITIONED BY (...)] [WITH ('k'='v', ...)]`.
-fn build_table_definition(table: &Table) -> String {
+fn build_table_definition(table: &Table) -> DFResult<String> {
     let identifier = table.identifier();
     let schema = table.schema();
     let mut ddl = String::new();
     let _ = write!(
         ddl,
         "CREATE TABLE {}.{} (",
-        identifier.database(),
-        identifier.object()
+        quote_identifier(identifier.database()),
+        quote_identifier(identifier.object())
     );
 
     for (i, field) in schema.fields().iter().enumerate() {
@@ -118,11 +118,11 @@ fn build_table_definition(table: &Table) -> String {
         }
         // `NOT NULL` is a column constraint; render it here at the column
         // level rather than inside nested type arguments (see `data_type_to_sql`).
-        let ty = data_type_to_sql(field.data_type());
+        let ty = data_type_to_sql(field.data_type())?;
         if field.data_type().is_nullable() {
-            let _ = write!(ddl, "{} {}", field.name(), ty);
+            let _ = write!(ddl, "{} {}", quote_identifier(field.name()), ty);
         } else {
-            let _ = write!(ddl, "{} {} NOT NULL", field.name(), ty);
+            let _ = write!(ddl, "{} {} NOT NULL", quote_identifier(field.name()), ty);
         }
     }
 
@@ -133,7 +133,7 @@ fn build_table_definition(table: &Table) -> String {
             if i > 0 {
                 ddl.push_str(", ");
             }
-            let _ = write!(ddl, "{}", pk);
+            let _ = write!(ddl, "{}", quote_identifier(pk));
         }
         ddl.push(')');
     }
@@ -146,24 +146,38 @@ fn build_table_definition(table: &Table) -> String {
             if i > 0 {
                 ddl.push_str(", ");
             }
-            let _ = write!(ddl, "{}", pk);
+            let _ = write!(ddl, "{}", quote_identifier(pk));
         }
         ddl.push(')');
     }
 
-    let options = schema.options();
+    let mut options: Vec<_> = schema.options().iter().collect();
+    options.sort_by(|(left, _), (right, _)| left.cmp(right));
     if !options.is_empty() {
         ddl.push_str(" WITH (");
         for (i, (k, v)) in options.iter().enumerate() {
             if i > 0 {
                 ddl.push_str(", ");
             }
-            let _ = write!(ddl, "'{}' = '{}'", k, v);
+            let _ = write!(
+                ddl,
+                "{} = {}",
+                quote_string_literal(k),
+                quote_string_literal(v)
+            );
         }
         ddl.push(')');
     }
 
-    ddl
+    Ok(ddl)
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn quote_string_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// Render a Paimon [`DataType`] as a SQL type string matching the syntax
@@ -173,53 +187,57 @@ fn build_table_definition(table: &Table) -> String {
 /// at the top of a column definition, not nested inside `MAP`, `ARRAY`, or
 /// `STRUCT` arguments. Callers that render a column should append `NOT NULL`
 /// themselves when the field is non-nullable; recursive calls below must not.
-fn data_type_to_sql(data_type: &DataType) -> String {
+fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
     match data_type {
-        DataType::Boolean(_) => "BOOLEAN".to_string(),
-        DataType::TinyInt(_) => "TINYINT".to_string(),
-        DataType::SmallInt(_) => "SMALLINT".to_string(),
-        DataType::Int(_) => "INT".to_string(),
-        DataType::BigInt(_) => "BIGINT".to_string(),
-        DataType::Decimal(t) => format!("DECIMAL({}, {})", t.precision(), t.scale()),
-        DataType::Double(_) => "DOUBLE".to_string(),
-        DataType::Float(_) => "FLOAT".to_string(),
-        DataType::Binary(t) => format!("BINARY({})", t.length()),
-        DataType::VarBinary(t) => format!("VARBINARY({})", t.length()),
-        DataType::Blob(_) => "BLOB".to_string(),
-        DataType::Char(t) => format!("CHAR({})", t.length()),
-        DataType::VarChar(t) => format!("VARCHAR({})", t.length()),
-        DataType::Date(_) => "DATE".to_string(),
-        DataType::Time(t) => format!("TIME({})", t.precision()),
-        DataType::Timestamp(t) => format!("TIMESTAMP({})", t.precision()),
-        DataType::LocalZonedTimestamp(t) => format!("TIMESTAMP_LTZ({})", t.precision()),
-        DataType::Array(t) => format!("ARRAY<{}>", data_type_to_sql(t.element_type())),
-        DataType::Map(t) => format!(
+        DataType::Boolean(_) => Ok("BOOLEAN".to_string()),
+        DataType::TinyInt(_) => Ok("TINYINT".to_string()),
+        DataType::SmallInt(_) => Ok("SMALLINT".to_string()),
+        DataType::Int(_) => Ok("INT".to_string()),
+        DataType::BigInt(_) => Ok("BIGINT".to_string()),
+        DataType::Decimal(t) => Ok(format!("DECIMAL({}, {})", t.precision(), t.scale())),
+        DataType::Double(_) => Ok("DOUBLE".to_string()),
+        DataType::Float(_) => Ok("FLOAT".to_string()),
+        DataType::Binary(t) => Ok(format!("BINARY({})", t.length())),
+        DataType::VarBinary(t) => Ok(format!("VARBINARY({})", t.length())),
+        DataType::Blob(_) => Ok("BLOB".to_string()),
+        DataType::Char(t) => Ok(format!("CHAR({})", t.length())),
+        DataType::VarChar(t) => Ok(format!("VARCHAR({})", t.length())),
+        DataType::Date(_) => Ok("DATE".to_string()),
+        DataType::Time(_) => Err(unsupported_show_create_table_type("TIME")),
+        DataType::Timestamp(t) => Ok(format!("TIMESTAMP({})", t.precision())),
+        DataType::LocalZonedTimestamp(t) => {
+            Ok(format!("TIMESTAMP({}) WITH TIME ZONE", t.precision()))
+        }
+        DataType::Array(t) => Ok(format!("ARRAY<{}>", data_type_to_sql(t.element_type())?)),
+        DataType::Map(t) => Ok(format!(
             "MAP({}, {})",
-            data_type_to_sql(t.key_type()),
-            data_type_to_sql(t.value_type())
-        ),
-        DataType::Multiset(t) => format!("MULTISET<{}>", data_type_to_sql(t.element_type())),
+            data_type_to_sql(t.key_type())?,
+            data_type_to_sql(t.value_type())?
+        )),
+        DataType::Multiset(_) => Err(unsupported_show_create_table_type("MULTISET")),
         DataType::Row(t) => {
             let inner: Vec<String> = t
                 .fields()
                 .iter()
                 .map(|f| {
-                    let ty = data_type_to_sql(f.data_type());
+                    let ty = data_type_to_sql(f.data_type())?;
                     if f.name().is_empty() {
-                        ty
+                        Ok(ty)
                     } else {
-                        format!("{} {}", f.name(), ty)
+                        Ok(format!("{} {}", quote_identifier(f.name()), ty))
                     }
                 })
-                .collect();
-            format!("STRUCT<{}>", inner.join(", "))
+                .collect::<DFResult<_>>()?;
+            Ok(format!("STRUCT<{}>", inner.join(", ")))
         }
-        DataType::Vector(t) => format!(
-            "VECTOR<{}, {}>",
-            data_type_to_sql(t.element_type()),
-            t.length()
-        ),
+        DataType::Vector(_) => Err(unsupported_show_create_table_type("VECTOR")),
     }
+}
+
+fn unsupported_show_create_table_type(type_name: &str) -> DataFusionError {
+    DataFusionError::NotImplemented(format!(
+        "SHOW CREATE TABLE does not support {type_name} columns because paimon-rust cannot round-trip this type in CREATE TABLE"
+    ))
 }
 
 /// Distribute `items` into `num_buckets` groups using round-robin assignment.

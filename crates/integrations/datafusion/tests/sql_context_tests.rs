@@ -22,7 +22,10 @@ use std::sync::Arc;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
 use paimon::catalog::Identifier;
-use paimon::spec::{ArrayType, BlobType, DataType, IntType, MapType, VarCharType};
+use paimon::spec::{
+    ArrayType, BlobType, DataType, FloatType, IntType, LocalZonedTimestampType, MapType,
+    MultisetType, TimeType, VarCharType, VectorType,
+};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
@@ -1310,16 +1313,16 @@ async fn test_show_create_table_simple() {
 
     let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
     assert!(
-        definition.contains("CREATE TABLE test_db.t"),
-        "definition should start with CREATE TABLE test_db.t, got: {definition}"
+        definition.contains("CREATE TABLE \"test_db\".\"t\""),
+        "definition should start with CREATE TABLE \"test_db\".\"t\", got: {definition}"
     );
     assert!(
-        definition.contains("id INT"),
-        "definition should contain `id INT`, got: {definition}"
+        definition.contains("\"id\" INT"),
+        "definition should contain `\"id\" INT`, got: {definition}"
     );
     assert!(
-        definition.contains("name VARCHAR("),
-        "definition should contain `name VARCHAR(...)`, got: {definition}"
+        definition.contains("\"name\" VARCHAR("),
+        "definition should contain `\"name\" VARCHAR(...)`, got: {definition}"
     );
 }
 
@@ -1339,8 +1342,8 @@ async fn test_show_create_table_with_primary_key() {
 
     let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
     assert!(
-        definition.contains("PRIMARY KEY (id)"),
-        "definition should contain PRIMARY KEY (id), got: {definition}"
+        definition.contains("PRIMARY KEY (\"id\")"),
+        "definition should contain PRIMARY KEY (\"id\"), got: {definition}"
     );
 }
 
@@ -1363,8 +1366,8 @@ async fn test_show_create_table_with_partition_and_options() {
 
     let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
     assert!(
-        definition.contains("PARTITIONED BY (pt)"),
-        "definition should contain PARTITIONED BY (pt), got: {definition}"
+        definition.contains("PARTITIONED BY (\"pt\")"),
+        "definition should contain PARTITIONED BY (\"pt\"), got: {definition}"
     );
     assert!(
         definition.contains("'bucket' = '4'"),
@@ -1405,16 +1408,16 @@ async fn test_show_create_table_various_types() {
 
     let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
     for needle in [
-        "a BOOLEAN",
-        "b TINYINT",
-        "c SMALLINT",
-        "d BIGINT",
-        "e DECIMAL(10, 2)",
-        "f DOUBLE",
-        "g FLOAT",
-        "h DATE",
-        "i TIMESTAMP(3)",
-        "j BLOB",
+        "\"a\" BOOLEAN",
+        "\"b\" TINYINT",
+        "\"c\" SMALLINT",
+        "\"d\" BIGINT",
+        "\"e\" DECIMAL(10, 2)",
+        "\"f\" DOUBLE",
+        "\"g\" FLOAT",
+        "\"h\" DATE",
+        "\"i\" TIMESTAMP(3)",
+        "\"j\" BLOB",
     ] {
         assert!(
             definition.contains(needle),
@@ -1519,8 +1522,8 @@ async fn test_show_create_table_round_trip() {
     // catalog prefix; paimon is the default catalog so this resolves back
     // to the same catalog/database.
     assert!(
-        definition.starts_with("CREATE TABLE test_db.t1"),
-        "definition should start with `CREATE TABLE test_db.t1`, got: {definition}"
+        definition.starts_with("CREATE TABLE \"test_db\".\"t1\""),
+        "definition should start with `CREATE TABLE \"test_db\".\"t1\"`, got: {definition}"
     );
 
     catalog
@@ -1541,4 +1544,138 @@ async fn test_show_create_table_round_trip() {
         .await
         .expect("recreated table exists");
     assert_schema_equivalent(&original_schema, recreated.schema());
+}
+
+#[tokio::test]
+async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    let identifier = Identifier::new("test_db", "select");
+    let schema = paimon::spec::Schema::builder()
+        .column("group", DataType::Int(IntType::with_nullable(false)))
+        .column("order", DataType::Int(IntType::with_nullable(false)))
+        .column(
+            "nested",
+            DataType::Row(paimon::spec::RowType::new(vec![
+                paimon::spec::DataField::new(
+                    0,
+                    "from".to_string(),
+                    DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+                ),
+            ])),
+        )
+        .column(
+            "ts_ltz",
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+        )
+        .primary_key(vec!["group", "order"])
+        .partition_keys(vec!["group"])
+        .option("comment", "Bob's table")
+        .build()
+        .expect("schema should build");
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .expect("table should be created");
+    let original = catalog.get_table(&identifier).await.expect("table exists");
+    let original_schema = original.schema().clone();
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.\"select\"").await;
+    assert!(
+        definition.starts_with("CREATE TABLE \"test_db\".\"select\""),
+        "definition should quote table identifiers, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"order\" INT NOT NULL"),
+        "definition should quote column identifiers, got: {definition}"
+    );
+    assert!(
+        definition.contains("PRIMARY KEY (\"group\", \"order\")"),
+        "definition should quote primary key identifiers, got: {definition}"
+    );
+    assert!(
+        definition.contains("PARTITIONED BY (\"group\")"),
+        "definition should quote partition identifiers, got: {definition}"
+    );
+    assert!(
+        definition.contains("STRUCT<\"from\" VARCHAR"),
+        "definition should quote nested struct field identifiers, got: {definition}"
+    );
+    assert!(
+        definition.contains("'comment' = 'Bob''s table'"),
+        "definition should escape string literals, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"ts_ltz\" TIMESTAMP(3) WITH TIME ZONE"),
+        "definition should render TIMESTAMP WITH TIME ZONE for LTZ, got: {definition}"
+    );
+
+    catalog
+        .drop_table(&identifier, false)
+        .await
+        .expect("drop should succeed");
+
+    sql_context
+        .sql(&definition)
+        .await
+        .expect("DDL should re-execute")
+        .collect()
+        .await
+        .expect("DDL should execute");
+
+    let recreated = catalog
+        .get_table(&identifier)
+        .await
+        .expect("recreated table exists");
+    assert_schema_equivalent(&original_schema, recreated.schema());
+}
+
+#[tokio::test]
+async fn test_show_create_table_rejects_non_round_trippable_types() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    for (table_name, data_type, type_name) in [
+        ("time_t", DataType::Time(TimeType::new(3).unwrap()), "TIME"),
+        (
+            "multiset_t",
+            DataType::Multiset(MultisetType::new(DataType::Int(IntType::new()))),
+            "MULTISET",
+        ),
+        (
+            "vector_t",
+            DataType::Vector(VectorType::new(4, DataType::Float(FloatType::new())).unwrap()),
+            "VECTOR",
+        ),
+    ] {
+        let identifier = Identifier::new("test_db", table_name);
+        let schema = paimon::spec::Schema::builder()
+            .column("unsupported_col", data_type)
+            .build()
+            .expect("schema should build");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .expect("table should be created");
+
+        let err = sql_context
+            .sql(&format!("SHOW CREATE TABLE paimon.test_db.{table_name}"))
+            .await
+            .expect_err("SHOW CREATE TABLE should reject unsupported type");
+        assert!(
+            err.to_string().contains(type_name),
+            "error should mention {type_name}, got: {err}"
+        );
+    }
 }

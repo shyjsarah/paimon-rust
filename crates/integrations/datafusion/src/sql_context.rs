@@ -677,7 +677,7 @@ impl SQLContext {
                 let pk_cols: Vec<String> = pk
                     .columns
                     .iter()
-                    .map(|c| c.column.expr.to_string())
+                    .map(|c| primary_key_column_name(&c.column.expr))
                     .collect();
                 builder = builder.primary_key(pk_cols);
             }
@@ -1600,6 +1600,13 @@ fn column_def_to_add_column(col: &ColumnDef) -> DFResult<SchemaChange> {
 
 fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
     sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))
+}
+
+fn primary_key_column_name(expr: &SqlExpr) -> String {
+    match expr {
+        SqlExpr::Identifier(ident) => ident.value.clone(),
+        _ => expr.to_string(),
+    }
 }
 
 fn column_def_nullable(col: &ColumnDef) -> bool {
