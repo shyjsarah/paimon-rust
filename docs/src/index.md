@@ -34,7 +34,7 @@ Key features:
 
 ## Status
 
-The project is under active development, tracking the [0.1.0 milestone](https://github.com/apache/paimon-rust/issues/3).
+The project is under active development (0.3.0 in development).
 
 ## License
 

@@ -49,6 +49,9 @@ pub use schema::*;
 mod schema_change;
 pub use schema_change::*;
 
+mod variant_metadata;
+pub use variant_metadata::*;
+
 mod snapshot;
 pub use snapshot::*;
 
@@ -90,6 +93,7 @@ mod predicate;
 pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;
 pub(crate) use predicate::extract_datum;
+pub(crate) use predicate::java_bytes_cmp;
 pub use predicate::{
     field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator,
 };

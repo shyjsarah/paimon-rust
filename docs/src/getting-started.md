@@ -25,7 +25,7 @@ Add `paimon` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-paimon = "0.1.0"
+paimon = "0.2.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -33,7 +33,7 @@ By default, the `storage-fs` (local filesystem) and `storage-memory` (in-memory)
 
 ```toml
 [dependencies]
-paimon = { version = "0.1.0", features = ["storage-s3"] }
+paimon = { version = "0.2.0", features = ["storage-s3"] }
 ```
 
 Available storage features:
@@ -57,7 +57,7 @@ Mosaic data files can be read by enabling the `mosaic` feature:
 
 ```toml
 [dependencies]
-paimon = { version = "0.1.0", features = ["mosaic"] }
+paimon = { version = "0.2.0", features = ["mosaic"] }
 ```
 
 The current Mosaic support is read-only. Paimon Rust can read existing `.mosaic` data files in a Paimon table, but it does not write Mosaic data files yet.
