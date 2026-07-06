@@ -151,7 +151,7 @@ fn build_table_definition(table: &Table) -> DFResult<String> {
     }
 
     let mut options: Vec<_> = schema.options().iter().collect();
-    options.sort_by(|(left, _), (right, _)| left.cmp(right));
+    options.sort_by_key(|(left, _)| *left);
     if !options.is_empty() {
         ddl.push_str(" WITH (");
         for (i, (k, v)) in options.iter().enumerate() {
