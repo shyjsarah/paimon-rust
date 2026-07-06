@@ -46,7 +46,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, CreateView, Delete,
     Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
@@ -61,7 +62,7 @@ use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BlobType, BooleanType, DataField as PaimonDataField,
     DataType as PaimonDataType, DateType, Datum, DecimalType, DoubleType, FloatType, IntType,
     LocalZonedTimestampType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
-    SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
+    SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
 };
 
 use crate::error::to_datafusion_error;
@@ -93,12 +94,19 @@ impl Default for SQLContext {
 impl SQLContext {
     /// Creates a new empty SQL context.
     pub fn new() -> Self {
-        let ctx =
-            SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
-        ctx.register_relation_planner(Arc::new(
-            crate::relation_planner::PaimonRelationPlanner::new(),
-        ))
-        .expect("failed to register relation planner");
+        let state = SessionStateBuilder::new()
+            .with_config(crate::lateral_vector_search::session_config())
+            .with_default_features()
+            .with_relation_planners(vec![Arc::new(
+                crate::relation_planner::PaimonRelationPlanner::new(),
+            )])
+            .with_optimizer_rules(crate::lateral_vector_search::optimizer_rules())
+            .with_query_planner(Arc::new(
+                crate::lateral_vector_search::PaimonQueryPlanner::new(),
+            ))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        crate::variant_functions::register_variant_functions(&ctx);
         Self {
             ctx,
             catalogs: HashMap::new(),
@@ -245,7 +253,6 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
 
         let paimon_provider = catalog_provider
-            .as_any()
             .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
@@ -268,7 +275,6 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
 
         let paimon_provider = catalog_provider
-            .as_any()
             .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
@@ -288,7 +294,6 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
 
         let paimon_provider = catalog_provider
-            .as_any()
             .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog}' is not a Paimon catalog"))
@@ -960,10 +965,18 @@ impl SQLContext {
     /// with a clear message is safer than writing against a different schema
     /// than concurrent reads observe.
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
-        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
+        use paimon::spec::{
+            SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_VERSION_OPTION,
+        };
 
         let options = self.dynamic_options.read().unwrap();
-        for key in [SCAN_VERSION_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION] {
+        for key in [
+            SCAN_VERSION_OPTION,
+            SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+        ] {
             if options.contains_key(key) {
                 return Err(DataFusionError::Plan(format!(
                     "Cannot execute {operation} while time-travel option '{key}' is set; \
@@ -1079,14 +1092,26 @@ impl SQLContext {
 
         // Resolve target column mapping from the explicit column list.
         // `columns` = before PARTITION, `after_columns` = after PARTITION (Hive-style).
-        let target_columns = if !insert.columns.is_empty() {
-            Some(&insert.columns)
+        let target_columns: Option<Vec<String>> = if !insert.columns.is_empty() {
+            Some(
+                insert
+                    .columns
+                    .iter()
+                    .map(object_name_to_single_identifier)
+                    .collect::<DFResult<_>>()?,
+            )
         } else if !insert.after_columns.is_empty() {
-            Some(&insert.after_columns)
+            Some(
+                insert
+                    .after_columns
+                    .iter()
+                    .map(|ident| ident.value.clone())
+                    .collect(),
+            )
         } else {
             None
         };
-        let column_reorder: Option<Vec<usize>> = if let Some(cols) = target_columns {
+        let column_reorder: Option<Vec<usize>> = if let Some(cols) = target_columns.as_ref() {
             if cols.len() != expected_source_cols {
                 return Err(DataFusionError::Plan(format!(
                     "Column list has {} columns, but expected {} non-partition columns",
@@ -1094,7 +1119,7 @@ impl SQLContext {
                     expected_source_cols
                 )));
             }
-            let col_names: Vec<&str> = cols.iter().map(|id| id.value.as_str()).collect();
+            let col_names: Vec<&str> = cols.iter().map(String::as_str).collect();
             let mut reorder = Vec::with_capacity(expected_source_cols);
             for field in &non_static_fields {
                 let pos = col_names
@@ -1666,6 +1691,13 @@ fn sql_data_type_to_paimon_type(
             ))
         }
         SqlType::Blob(_) => Ok(PaimonDataType::Blob(BlobType::with_nullable(nullable))),
+        SqlType::Custom(name, modifiers)
+            if name.to_string().eq_ignore_ascii_case("VARIANT") && modifiers.is_empty() =>
+        {
+            Ok(PaimonDataType::Variant(VariantType::with_nullable(
+                nullable,
+            )))
+        }
         SqlType::Date => Ok(PaimonDataType::Date(DateType::with_nullable(nullable))),
         SqlType::Timestamp(precision, tz_info) => {
             let precision = match precision {
@@ -1754,6 +1786,18 @@ fn object_name_to_string(name: &ObjectName) -> String {
         .filter_map(|p| p.as_ident().map(|id| id.value.clone()))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn object_name_to_single_identifier(name: &ObjectName) -> DFResult<String> {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .map(|id| id.value.clone())
+            .ok_or_else(|| DataFusionError::Plan(format!("Invalid column name: {name}"))),
+        _ => Err(DataFusionError::Plan(format!(
+            "Expected a simple column name, got: {name}"
+        ))),
+    }
 }
 
 /// Extract key-value pairs from [`CreateTableOptions`].
@@ -2093,7 +2137,8 @@ fn datum_to_constant_array(
             | Datum::Timestamp { .. }
             | Datum::LocalZonedTimestamp { .. }
             | Datum::Decimal { .. }
-            | Datum::Bytes(_) => Err(DataFusionError::Plan(format!(
+            | Datum::Bytes(_)
+            | Datum::Variant { .. } => Err(DataFusionError::Plan(format!(
                 "Unsupported datum type for partition column: {d}"
             ))),
         },
@@ -2803,6 +2848,15 @@ mod tests {
             PaimonDataType::VarBinary(
                 VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
             ),
+        );
+    }
+
+    #[test]
+    fn test_sql_type_variant() {
+        use datafusion::sql::sqlparser::ast::{DataType as SqlType, Ident, ObjectName};
+        assert_sql_type_to_paimon(
+            SqlType::Custom(ObjectName::from(Ident::new("VARIANT")), vec![]),
+            PaimonDataType::Variant(VariantType::new()),
         );
     }
 

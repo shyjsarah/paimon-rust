@@ -23,6 +23,9 @@ pub(crate) trait StatsAccessor {
     fn null_count(&self, index: usize) -> Option<i64>;
     fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum>;
     fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum>;
+    fn supports_in_min_max_pruning(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) fn predicates_may_match_with_schema<T: StatsAccessor>(
@@ -59,7 +62,11 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::IsNotNull => {
             return all_null != Some(true);
         }
-        PredicateOperator::In | PredicateOperator::NotIn => {
+        PredicateOperator::In if stats.supports_in_min_max_pruning() => {}
+        PredicateOperator::In => {
+            return true;
+        }
+        PredicateOperator::NotIn => {
             return true;
         }
         PredicateOperator::EndsWith | PredicateOperator::Contains => {
@@ -113,6 +120,18 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
     };
 
     match op {
+        PredicateOperator::In => {
+            if !matches!(
+                min_value.partial_cmp(&max_value),
+                Some(Ordering::Less | Ordering::Equal)
+            ) {
+                return true;
+            }
+            literals.iter().any(|literal| {
+                !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
+                    && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
+            })
+        }
         PredicateOperator::Eq => {
             !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
@@ -180,7 +199,6 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
-        | PredicateOperator::In
         | PredicateOperator::NotIn
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
@@ -300,7 +318,10 @@ fn predicate_may_match_with_schema<T: StatsAccessor>(
         Predicate::And(children) => children
             .iter()
             .all(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
-        Predicate::Or(_) | Predicate::Not(_) => true,
+        Predicate::Or(children) => children
+            .iter()
+            .any(|child| predicate_may_match_with_schema(child, stats, field_mapping, file_fields)),
+        Predicate::Not(_) => true,
         Predicate::Leaf {
             index,
             data_type,
@@ -521,6 +542,12 @@ mod tests {
     fn run_int(op: PredicateOperator, lits: &[Datum], stats: &MockStats) -> bool {
         let dt = DataType::Int(IntType::new());
         data_leaf_may_match(0, &dt, &dt, op, lits, stats)
+    }
+
+    #[test]
+    fn in_falls_open_when_accessor_does_not_opt_in() {
+        let stats = int_stats(10, 20);
+        assert!(run_int(PredicateOperator::In, &[Datum::Int(30)], &stats));
     }
 
     /// Stage 3 invariant: a `Between` leaf and the equivalent `GtEq+LtEq`

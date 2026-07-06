@@ -223,10 +223,14 @@ impl<'a> ReadBuilder<'a> {
             self.limit,
             self.row_ranges.clone(),
         )
+        .with_projection(self.projected_fields.clone())
     }
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
+        // Fail closed at read construction so bindings that short-circuit before
+        // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
+        CoreOptions::new(self.table.schema.options()).ensure_read_authorized()?;
         let read_type = match &self.projected_fields {
             None => self.table.schema.fields().to_vec(),
             Some(projected) => self.resolve_projected_fields(projected)?,
@@ -239,54 +243,90 @@ impl<'a> ReadBuilder<'a> {
         ))
     }
 
-    fn resolve_projected_fields(&self, projected_fields: &[String]) -> Result<Vec<DataField>> {
-        if projected_fields.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let full_name = self.table.identifier().full_name();
-        let field_map: HashMap<&str, &DataField> = self
-            .table
-            .schema
-            .fields()
-            .iter()
-            .map(|field| (field.name(), field))
-            .collect();
-
-        let mut seen = HashSet::with_capacity(projected_fields.len());
-        let mut resolved = Vec::with_capacity(projected_fields.len());
-
-        for name in projected_fields {
-            if !seen.insert(name.as_str()) {
-                return Err(Error::ConfigInvalid {
-                    message: format!("Duplicate projection column '{name}' for table {full_name}"),
-                });
-            }
-
-            if name == crate::spec::ROW_ID_FIELD_NAME {
-                resolved.push(DataField::new(
-                    crate::spec::ROW_ID_FIELD_ID,
-                    crate::spec::ROW_ID_FIELD_NAME.to_string(),
-                    crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
-                ));
-                continue;
-            }
-
-            let field = field_map
-                .get(name.as_str())
-                .ok_or_else(|| Error::ColumnNotExist {
-                    full_name: full_name.clone(),
-                    column: name.clone(),
-                })?;
-            resolved.push((*field).clone());
-        }
-
-        Ok(resolved)
+    pub(super) fn resolve_projected_fields(
+        &self,
+        projected_fields: &[String],
+    ) -> Result<Vec<DataField>> {
+        resolve_projected_fields(
+            self.table.identifier().full_name(),
+            self.table.schema.fields(),
+            projected_fields,
+        )
     }
+}
+
+pub(super) fn resolve_projected_fields(
+    full_name: String,
+    fields: &[DataField],
+    projected_fields: &[String],
+) -> Result<Vec<DataField>> {
+    if projected_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let field_map: HashMap<&str, &DataField> =
+        fields.iter().map(|field| (field.name(), field)).collect();
+
+    let mut seen = HashSet::with_capacity(projected_fields.len());
+    let mut resolved = Vec::with_capacity(projected_fields.len());
+
+    for name in projected_fields {
+        if !seen.insert(name.as_str()) {
+            return Err(Error::ConfigInvalid {
+                message: format!("Duplicate projection column '{name}' for table {full_name}"),
+            });
+        }
+
+        if name == crate::spec::ROW_ID_FIELD_NAME {
+            resolved.push(DataField::new(
+                crate::spec::ROW_ID_FIELD_ID,
+                crate::spec::ROW_ID_FIELD_NAME.to_string(),
+                crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
+            ));
+            continue;
+        }
+
+        let field = field_map
+            .get(name.as_str())
+            .ok_or_else(|| Error::ColumnNotExist {
+                full_name: full_name.clone(),
+                column: name.clone(),
+            })?;
+        resolved.push((*field).clone());
+    }
+
+    Ok(resolved)
+}
+
+pub(super) fn projected_read_field_ids(
+    full_name: String,
+    fields: &[DataField],
+    projected_fields: Option<&Vec<String>>,
+) -> Result<Option<HashSet<i32>>> {
+    let Some(projected) = projected_fields else {
+        return Ok(None);
+    };
+    let fields = resolve_projected_fields(full_name, fields, projected)?;
+    let field_ids = fields
+        .into_iter()
+        .filter(|field| !is_system_projection_field(field.id()))
+        .map(|field| field.id())
+        .collect::<HashSet<_>>();
+    Ok(Some(field_ids))
+}
+
+pub(super) fn is_system_projection_field(field_id: i32) -> bool {
+    matches!(
+        field_id,
+        crate::spec::ROW_ID_FIELD_ID
+            | crate::spec::SEQUENCE_NUMBER_FIELD_ID
+            | crate::spec::VALUE_KIND_FIELD_ID
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ReadBuilder;
     use crate::table::TableRead;
     mod test_utils {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
@@ -297,9 +337,10 @@ mod tests {
     use crate::spec::{
         BinaryRow, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema, VarCharType,
     };
-    use crate::table::{DataSplitBuilder, Table};
+    use crate::table::{query_auth_table, DataSplitBuilder, Table};
     use arrow_array::{Int32Array, RecordBatch};
     use futures::TryStreamExt;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use tempfile::tempdir;
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
@@ -358,6 +399,95 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        // `new_read` fails closed, so bindings that short-circuit before `to_arrow` can't bypass.
+        let err = table.new_read_builder().new_read().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "building a read for a query-auth.enabled table must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_option_cannot_disable_query_auth() {
+        // Copying the table with the option off must not weaken a stored `true`.
+        let table = query_auth_table().copy_with_options(HashMap::from([(
+            "query-auth.enabled".to_string(),
+            "false".to_string(),
+        )]));
+        let err = table.new_read_builder().new_read().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "a dynamic override must not disable query-auth"
+        );
+    }
+
+    #[test]
+    fn test_projected_read_field_ids_uses_projection_ids() {
+        let table = simple_table();
+        let projected = vec!["id".to_string()];
+
+        assert_eq!(
+            super::projected_read_field_ids(
+                table.identifier().full_name(),
+                table.schema().fields(),
+                Some(&projected),
+            )
+            .unwrap(),
+            Some(HashSet::from([1]))
+        );
+    }
+
+    #[test]
+    fn test_projected_read_field_ids_ignores_system_only_projection() {
+        let table = simple_table();
+        let projected = vec![crate::spec::ROW_ID_FIELD_NAME.to_string()];
+
+        assert_eq!(
+            super::projected_read_field_ids(
+                table.identifier().full_name(),
+                table.schema().fields(),
+                Some(&projected),
+            )
+            .unwrap(),
+            Some(HashSet::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_scan_validates_unknown_projection() {
+        let table = simple_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["missing"]);
+
+        let err = builder.new_scan().plan().await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::ColumnNotExist {
+                full_name,
+                column,
+            } if full_name == "default.t" && column == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_new_scan_validates_duplicate_projection() {
+        let table = simple_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["id", "id"]);
+
+        let err = builder.new_scan().plan().await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message }
+                if message.contains("Duplicate projection column 'id'")
+        ));
     }
 
     #[test]

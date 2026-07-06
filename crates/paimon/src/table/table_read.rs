@@ -74,6 +74,8 @@ impl<'a> TableRead<'a> {
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema.options());
+        // Fail closed for a direct `TableRead` (bypassing `ReadBuilder::new_read`).
+        core_options.ensure_read_authorized()?;
         let merge_engine = core_options.merge_engine()?;
 
         // PK table with Deduplicate engine: splits that may hold multiple
@@ -237,6 +239,7 @@ mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{BinaryRow, DataFileMeta};
+    use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
 
     fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
@@ -297,5 +300,20 @@ mod tests {
         assert!(pk_split_needs_merge(&dv_l0, true));
         let dv_compacted = split(vec![file("a", 5, None)], false);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
+    }
+
+    #[test]
+    fn test_direct_table_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        // Bypass `ReadBuilder` by constructing `TableRead` directly; the `to_arrow` guard
+        // still fails closed.
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        assert!(
+            matches!(
+                read.to_arrow(&[]),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "directly-constructed read of a query-auth.enabled table must fail closed"
+        );
     }
 }

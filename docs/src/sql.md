@@ -25,9 +25,9 @@ under the License.
 
 ```toml
 [dependencies]
-paimon = "0.1.0"
-paimon-datafusion = "0.1.0"
-datafusion = "53"
+paimon = "0.3.0"
+paimon-datafusion = "0.3.0"
+datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -35,13 +35,26 @@ To query tables with Mosaic data files, enable the `mosaic` feature on both crat
 
 ```toml
 [dependencies]
-paimon = { version = "0.1.0", features = ["mosaic"] }
-paimon-datafusion = { version = "0.1.0", features = ["mosaic"] }
-datafusion = "53"
+paimon = { version = "0.3.0", features = ["mosaic"] }
+paimon-datafusion = { version = "0.3.0", features = ["mosaic"] }
+datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
 Mosaic support is currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
+
+## SQL Support Scope
+
+`paimon-datafusion` currently targets Apache DataFusion 54.x. The workspace pins `datafusion = "54.0.0"`.
+
+SQL support has two layers:
+
+- DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+
+Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, persistent `CREATE VIEW`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
+
+For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
 ## Registering Catalog
 
@@ -58,14 +71,14 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = Arc::new(FileSystemCatalog::new(options)?);
 
     let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog)?;
+    ctx.register_catalog("paimon", catalog).await?;
     let df = ctx.sql("SELECT * FROM paimon.default.my_table").await?;
     df.show().await?;
     Ok(())
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `full_text_search`) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
+`SQLContext::new` creates a session context with the Paimon relation planner pre-registered. Use `register_catalog(...).await` to add one or more Paimon catalogs; registering a catalog also registers the built-in table-valued functions (`vector_search`, `full_text_search`) against it. It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
 ## Data Types
 
@@ -82,6 +95,7 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `DOUBLE` / `DOUBLE PRECISION` | DoubleType | |
 | `VARCHAR` / `TEXT` / `STRING` / `CHAR` | VarCharType | |
 | `BINARY` / `VARBINARY` / `BYTEA` | VarBinaryType | |
+| `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
 | `DATE` | DateType | |
 | `TIMESTAMP[(p)]` | TimestampType | Precision p: 0/3/6/9, default 3 |
@@ -91,12 +105,178 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
+### Variant Usage
+
+`VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
+
+Create `VARIANT` columns like ordinary table columns:
+
+```sql
+CREATE TABLE paimon.my_db.user_events (
+    user_id BIGINT NOT NULL,
+    event_time TIMESTAMP,
+    payload VARIANT,
+    attributes VARIANT,
+    dt STRING,
+    PRIMARY KEY (user_id, dt)
+) PARTITIONED BY (dt)
+WITH ('bucket' = '4');
+```
+
+`VARIANT` columns can be nullable or `NOT NULL`:
+
+```sql
+CREATE TABLE paimon.my_db.variant_examples (
+    id INT NOT NULL,
+    payload VARIANT NOT NULL,
+    optional_payload VARIANT
+);
+```
+
+Do not use `VARIANT` as a partition column. Partition values must be scalar strings, numbers, dates, or timestamps that can be encoded as stable partition names.
+
+Use `parse_json` when inserting JSON text into a `VARIANT` column:
+
+```sql
+INSERT INTO paimon.my_db.user_events VALUES
+(
+    1,
+    TIMESTAMP '2024-01-01 10:00:00',
+    parse_json('{"event":"login","device":{"os":"ios","version":17},"score":98.5}'),
+    parse_json('{"city":"Beijing","tags":["new","mobile"],"vip":true}'),
+    '2024-01-01'
+);
+```
+
+`parse_json` rejects invalid JSON and duplicate object keys. Use `try_parse_json` when malformed JSON should become SQL `NULL` instead of failing the query:
+
+```sql
+INSERT INTO paimon.my_db.user_events
+SELECT
+    user_id,
+    event_time,
+    try_parse_json(raw_payload),
+    try_parse_json(raw_attributes),
+    dt
+FROM staging_events;
+```
+
+`SQLContext::new` registers Spark-compatible scalar functions for common `VARIANT` workflows:
+
+```sql
+SELECT
+    user_id,
+    variant_get(payload, '$.event', 'string') AS event_name,
+    variant_get(payload, '$.device.os', 'string') AS os,
+    variant_get(payload, '$.score', 'double') AS score,
+    variant_get(attributes, '$.tags[0]', 'string') AS first_tag
+FROM paimon.my_db.user_events
+WHERE variant_get(attributes, '$.vip', 'boolean') = true;
+```
+
+Supported functions:
+
+| Function | Notes |
+|---|---|
+| `parse_json(json)` | Parses a JSON string into `VARIANT`; invalid JSON returns an error |
+| `try_parse_json(json)` | Parses a JSON string into `VARIANT`; invalid JSON returns `NULL` |
+| `variant_get(v, path[, type])` | Extracts a path; missing paths return `NULL`; invalid casts return an error |
+| `try_variant_get(v, path[, type])` | Extracts a path; missing paths, invalid paths, and invalid casts return `NULL` |
+| `is_variant_null(v)` | Returns true for JSON `null` inside `VARIANT`; SQL `NULL` returns false |
+
+Path syntax supports the root path `$`, object access (`$.field`), quoted object access (`$["field"]` or `$['field']`), array indexes (`$[0]`), and nested combinations such as `$.items[0].price`.
+
+The optional `type` argument is a string literal. Supported result types are `variant` (or omitted), `boolean`, `byte` / `tinyint`, `short` / `smallint`, `int` / `integer`, `long` / `bigint`, `float`, `double`, `decimal(p, s)`, and `string`.
+
+When `type` is omitted or set to `variant`, `variant_get` returns a nested `VARIANT` value that can be passed to another `variant_get` call:
+
+```sql
+SELECT
+    variant_get(
+        variant_get(payload, '$.device'),
+        '$.os',
+        'string'
+    ) AS os
+FROM paimon.my_db.user_events;
+```
+
+Missing paths return SQL `NULL`. JSON `null` is represented as a non-SQL-null Variant value, so use `is_variant_null` when you need to distinguish it:
+
+```sql
+SELECT
+    is_variant_null(parse_json('null')) AS json_null,
+    is_variant_null(NULL) AS sql_null;
+```
+
+### Variant Shredding
+
+Variant shredding stores selected fields from a `VARIANT` column as typed
+physical fields in Parquet files while keeping the logical table schema as
+`VARIANT`. Reads are automatic: when a projected `VARIANT` column is stored in
+shredded physical form, Paimon Rust assembles it back into the normal
+value + metadata representation before returning the batch.
+
+Use a configured shredding schema when the hot fields are known in advance:
+
+```sql
+CREATE TABLE paimon.my_db.shredded_events (
+    user_id BIGINT,
+    payload VARIANT
+) WITH (
+    'file.format' = 'parquet',
+    'variant.shreddingSchema' =
+        '{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"event","type":"STRING"},{"name":"score","type":"DOUBLE"},{"name":"city","type":"STRING"}]}}]}'
+);
+```
+
+The configured schema is a Paimon `ROW` type encoded as JSON. Field IDs may be
+omitted; Paimon Rust assigns them by position. Each top-level field name must
+match a `VARIANT` column to shred. The field's type describes the typed fields
+to extract from that Variant value; values that do not match the typed field
+still remain in the Variant payload so the logical value can be rebuilt on read.
+
+Use inferred shredding when the hot fields should be discovered from the first
+rows written by each data-file writer:
+
+```sql
+CREATE TABLE paimon.my_db.inferred_events (
+    user_id BIGINT,
+    payload VARIANT
+) WITH (
+    'file.format' = 'parquet',
+    'variant.inferShreddingSchema' = 'true',
+    'variant.shredding.maxInferBufferRow' = '4096',
+    'variant.shredding.maxSchemaDepth' = '50',
+    'variant.shredding.maxSchemaWidth' = '300',
+    'variant.shredding.minFieldCardinalityRatio' = '0.1'
+);
+```
+
+When both configured and inferred shredding are set, the configured schema takes
+precedence. Shredding currently applies to Parquet data-file writes; ordinary
+non-shredded `VARIANT` files continue to read normally.
+
+Current limitations:
+
+- `schema_of_variant`, `schema_of_variant_agg`, `to_variant_object`, `variant_explode`, and `variant_explode_outer` are not implemented yet.
+- `variant_get` currently casts to scalar types and `VARIANT`. It does not yet cast directly to `ARRAY`, `MAP`, or `STRUCT`.
+- Predicate pushdown is not applied through `variant_get`; DataFusion evaluates Variant filters after reading rows.
+
+With a raw DataFusion `SessionContext`, register these scalar functions explicitly:
+
+```rust
+use paimon_datafusion::register_variant_functions;
+
+register_variant_functions(&ctx);
+```
+
 ## DDL
 
-### CREATE SCHEMA / DROP SCHEMA
+### CREATE DATABASE / CREATE SCHEMA / DROP SCHEMA
 
 ```sql
 CREATE SCHEMA paimon.my_db;
+CREATE DATABASE paimon.my_db;
 DROP SCHEMA paimon.my_db CASCADE;
 ```
 
@@ -249,10 +429,10 @@ The table type determines which row-level DML operations are supported:
 | `TRUNCATE TABLE` | Supported | Supported | Supported |
 | `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
 | `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
-| `DELETE` | Supported via Copy-on-Write | Not supported | Not supported |
-| `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE` and not-matched `INSERT`; matched `DELETE` is not supported |
+| `DELETE` | Supported via Copy-on-Write | Not supported | Supported when deletion vectors are enabled |
+| `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE`, matched `DELETE` with deletion vectors, and not-matched `INSERT` |
 
-A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
 
 ### INSERT INTO
 
@@ -264,6 +444,19 @@ INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
 
 ```sql
 INSERT INTO paimon.my_db.users SELECT * FROM source_table;
+```
+
+For `VARIANT` columns, convert JSON text with `parse_json` or `try_parse_json`:
+
+```sql
+INSERT INTO paimon.my_db.user_events (user_id, event_time, payload, attributes, dt)
+VALUES (
+    1,
+    TIMESTAMP '2024-01-01 10:00:00',
+    parse_json('{"event":"login","device":{"os":"ios"}}'),
+    try_parse_json('{"vip":true,"tags":["mobile"]}'),
+    '2024-01-01'
+);
 ```
 
 For primary-key tables, records with duplicate keys are deduplicated according to the merge engine (default: Deduplicate engine, where the last written value wins).
@@ -322,7 +515,9 @@ For append-only tables, deletes are executed using Copy-on-Write:
 DELETE FROM paimon.my_db.t WHERE name = 'b';
 ```
 
-`DELETE` is not supported on primary-key tables or data-evolution tables.
+For data-evolution row-tracking tables without primary keys, deletes are executed via deletion vectors and require `'deletion-vectors.enabled' = 'true'`.
+
+`DELETE` is not supported on primary-key tables.
 
 ### MERGE INTO
 
@@ -361,7 +556,7 @@ ON target.id = source.id
 WHEN MATCHED THEN UPDATE SET name = source.name;
 ```
 
-For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE` plus not-matched `INSERT`; matched `DELETE` is not yet supported. Primary-key tables are not supported for `MERGE INTO`.
+For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE`, matched `DELETE` when deletion vectors are enabled, and not-matched `INSERT`. Primary-key tables are not supported for `MERGE INTO`.
 
 ### TRUNCATE TABLE
 
@@ -476,6 +671,29 @@ All DataFusion query capabilities are supported (JOINs, aggregations, subqueries
 SELECT id, name FROM paimon.my_db.users WHERE id > 10 ORDER BY id LIMIT 100;
 ```
 
+### Variant Queries
+
+Use `variant_get` to extract fields from `VARIANT` columns. Provide a target type string when the query needs a scalar result:
+
+```sql
+SELECT
+    user_id,
+    variant_get(payload, '$.event', 'string') AS event_name,
+    variant_get(payload, '$.device.os', 'string') AS device_os,
+    variant_get(attributes, '$.vip', 'boolean') AS is_vip
+FROM paimon.my_db.user_events
+WHERE variant_get(payload, '$.event', 'string') = 'login';
+```
+
+Use `try_variant_get` when incompatible values should return `NULL`:
+
+```sql
+SELECT
+    user_id,
+    try_variant_get(payload, '$.score', 'double') AS score
+FROM paimon.my_db.user_events;
+```
+
 ### Column Projection
 
 Only the required columns are read, reducing I/O:
@@ -492,6 +710,7 @@ The following filter predicates are pushed down to the Paimon storage layer:
 - Logical: `AND`, `OR`
 - Null checks: `IS NULL`, `IS NOT NULL`
 - Range: `IN`, `NOT IN`, `BETWEEN`
+- String predicates: positive `LIKE`, including no-wildcard, prefix, suffix, contains, and more complex patterns. `NOT LIKE` and `ILIKE` are evaluated by DataFusion as residual filters.
 
 Filters on partition columns enable exact partition pruning, avoiding scans of irrelevant data.
 
@@ -540,6 +759,24 @@ SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 
 
 The function performs ANN search across all Lumina vector index files for the target column, merges results, and returns the top-k rows ordered by relevance score. If no matching index is found, an empty result is returned.
 
+### Lateral Joins
+
+Use `CROSS JOIN LATERAL` when query vectors come from another relation. In this mode, the third `vector_search` argument is a column reference from the left side of the join instead of a JSON literal:
+
+```sql
+SELECT q.id AS query_id, r.id AS result_id
+FROM paimon.my_db.queries q
+CROSS JOIN LATERAL vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    q.embedding,
+    10
+) AS r
+ORDER BY query_id, result_id;
+```
+
+The query-vector column must have Arrow type `List<Float32>` or `FixedSizeList<Float32>`. Null query-vector rows produce no joined results, and null elements inside a vector are rejected. The lateral form returns the left row joined with the top-k matching rows from the target Paimon table for that row's query vector.
+
 ### Supported Metrics
 
 The distance metric is configured at index creation time via table options:
@@ -572,8 +809,8 @@ Paimon supports full-text search via the Tantivy search engine. The `full_text_s
 
 ```toml
 [dependencies]
-paimon = { version = "0.1.0", features = ["fulltext"] }
-paimon-datafusion = { version = "0.1.0", features = ["fulltext"] }
+paimon = { version = "0.3.0", features = ["fulltext"] }
+paimon-datafusion = { version = "0.3.0", features = ["fulltext"] }
 ```
 
 ### Registration
@@ -723,7 +960,7 @@ CREATE TEMPORARY VIEW paimon.my_db.active_users AS SELECT * FROM paimon.my_db.us
 
 ### Deregister
 
-Use `deregister_temp_table` to remove a temporary table or view programmatically, or use the `DROP TEMPORARY TABLE` / `DROP TEMPORARY VIEW` SQL statements (see the [DDL section](#drop-temporary-table--drop-temporary-view)):
+Use `deregister_temp_table` to remove a temporary table or view programmatically, or use the `DROP TEMPORARY TABLE` / `DROP TEMPORARY VIEW` SQL statements (see the [DDL section](#drop-temporary-table-drop-temporary-view)):
 
 ```rust
 ctx.deregister_temp_table("paimon.my_db.users")?;
@@ -976,12 +1213,33 @@ rows (`DELETE` / `UPDATE_BEFORE`), deletion vectors, cross-partition dynamic
 bucket writes, or advanced aggregation options such as `ignore-retract`,
 `distinct`, `nested-key`, `count-limit`, and sequence groups.
 
+### Variant Shredding Options
+
+Set these as table options when writing `VARIANT` columns to Parquet. The
+logical table schema remains `VARIANT`; the options only affect the physical
+file layout and automatic read-time assembly.
+
+| Option | Default | Description |
+|---|---:|---|
+| `variant.shreddingSchema` | unset | Configured shredding schema as a Paimon `ROW` type JSON string. Top-level field names match `VARIANT` column names, and their nested types describe the typed fields to extract. |
+| `parquet.variant.shreddingSchema` | unset | Parquet-scoped alias for `variant.shreddingSchema`. |
+| `variant.inferShreddingSchema` | `false` | Enables per-writer schema inference for `VARIANT` columns when no configured shredding schema is set. |
+| `parquet.variant.inferShreddingSchema` | `false` | Parquet-scoped alias for `variant.inferShreddingSchema`. |
+| `variant.shredding.maxInferBufferRow` | `4096` | Number of initial rows buffered per data-file writer before inferring the shredding schema. If fewer rows are written, inference runs when the writer is flushed or closed. |
+| `variant.shredding.maxSchemaDepth` | `50` | Maximum nested depth considered by inference. |
+| `variant.shredding.maxSchemaWidth` | `300` | Maximum number of inferred typed fields across inferred Variant schemas. |
+| `variant.shredding.minFieldCardinalityRatio` | `0.1` | Minimum ratio of sampled non-null Variant values that must contain a field before inference keeps it as a typed field. |
+
+Configured shredding takes precedence over inferred shredding. If a table has no
+`VARIANT` columns, or none of these options enable shredding, Paimon Rust writes
+the normal physical format without wrapping the writer.
+
 ### Other Options
 
 | Option | Description |
 |---|---|
 | `'sequence.field' = 'col'` | Sequence field used to determine which record wins during deduplication |
-| `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE) |
+| `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
 | `'cross-partition-update.enabled' = 'true'` | Allow cross-partition updates |
 | `'changelog-producer' = 'input'` | Changelog producer (PK tables with input mode reject writes) |
@@ -1002,7 +1260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create SQL context and register catalog
     let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog)?;
+    ctx.register_catalog("paimon", catalog).await?;
 
     // Create database and table
     ctx.sql("CREATE SCHEMA paimon.my_db").await?;

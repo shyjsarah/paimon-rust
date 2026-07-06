@@ -48,6 +48,7 @@ mod read_builder;
 pub mod referenced_files;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
+mod scan_trace;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
@@ -69,13 +70,14 @@ use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
-pub use data_evolution_writer::DataEvolutionWriter;
+pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
+pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
@@ -88,12 +90,12 @@ pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
-pub use vector_search_builder::VectorSearchBuilder;
+pub use vector_search_builder::{BatchVectorSearchBuilder, VectorSearchBuilder};
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::{DataField, Snapshot, TableSchema};
+use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -185,6 +187,10 @@ impl Table {
         VectorSearchBuilder::new(self)
     }
 
+    pub fn new_batch_vector_search_builder(&self) -> BatchVectorSearchBuilder<'_> {
+        BatchVectorSearchBuilder::new(self)
+    }
+
     pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {
         LuminaIndexBuildBuilder::new(self)
     }
@@ -208,7 +214,10 @@ impl Table {
         // scans of such a copy fail until `copy_with_time_travel` re-resolves
         // it). Unrelated options keep the snapshot/schema pair intact.
         let selector_changed = extra.keys().any(|k| {
-            k == crate::spec::SCAN_VERSION_OPTION || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+            k == crate::spec::SCAN_VERSION_OPTION
+                || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+                || k == crate::spec::SCAN_SNAPSHOT_ID_OPTION
+                || k == crate::spec::SCAN_TAG_NAME_OPTION
         });
         Self {
             file_io: self.file_io.clone(),
@@ -232,14 +241,18 @@ impl Table {
     ///
     /// Mirrors Java `AbstractFileStoreTable.copy(dynamicOptions)` →
     /// `tryTimeTravel`: if the merged options contain a time-travel selector
-    /// (`scan.version` / `scan.timestamp-millis`) that resolves to a snapshot,
-    /// the table's fields and keys come from that snapshot's schema while the
-    /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
+    /// (`scan.version` / `scan.timestamp-millis` / `scan.snapshot-id` /
+    /// `scan.tag-name`) that resolves to a snapshot, the table's fields and
+    /// keys come from that snapshot's schema while the options stay the merged
+    /// ones (Java `TableSchema.copy(newOptions)`).
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
     pub async fn copy_with_time_travel(&self, extra: HashMap<String, String>) -> Result<Self> {
         let mut table = self.copy_with_options(extra);
+        // Reject unimplemented scan options on the merged view before any IO, so
+        // both table-level and per-read options are covered.
+        CoreOptions::new(table.schema().options()).validate_scan_options()?;
         // travel_to_snapshot returns Ok(None) without IO when the merged
         // options contain no selector.
         if let Ok(Some(snapshot)) =
@@ -263,6 +276,14 @@ impl Table {
         self.time_traveled
     }
 
+    /// Whether a time-travel selector in this copy's options resolved to a
+    /// snapshot. Lets external callers (e.g. the Python binding) distinguish
+    /// "selector set but unresolved" (silent fallback to latest) from a real
+    /// travelled read, so they can reject the former instead of reading latest.
+    pub fn has_resolved_travel_snapshot(&self) -> bool {
+        self.travel_snapshot.is_some()
+    }
+
     /// The snapshot resolved by [`Table::copy_with_time_travel`] from this
     /// copy's options, if any. Lets scans skip re-resolving the selector.
     pub(crate) fn travel_snapshot(&self) -> Option<&Snapshot> {
@@ -275,4 +296,29 @@ pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 
 pub(crate) fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
     fields.iter().find(|f| f.name() == name).map(|f| f.id())
+}
+
+/// A minimal table with `query-auth.enabled = true`, for the fail-closed read guard.
+#[cfg(test)]
+pub(crate) fn query_auth_table() -> Table {
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+    let file_io = FileIOBuilder::new("file").build().unwrap();
+    let table_schema = TableSchema::new(
+        0,
+        &Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap(),
+    );
+    Table::new(
+        file_io,
+        Identifier::new("default", "auth_t"),
+        "/tmp/test-query-auth-table".to_string(),
+        table_schema,
+        None,
+    )
 }

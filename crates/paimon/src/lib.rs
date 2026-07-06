@@ -37,6 +37,7 @@ pub mod spec;
 pub mod table;
 #[cfg(feature = "fulltext")]
 pub mod tantivy;
+pub mod variant;
 pub mod vector_search;
 pub mod vindex;
 
@@ -45,8 +46,8 @@ pub use catalog::CatalogFactory;
 pub use catalog::FileSystemCatalog;
 
 pub use table::{
-    CommitMessage, DataEvolutionWriter, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket,
-    Plan, RESTEnv, RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit, RowRange,
-    SnapshotCommit, SnapshotManager, Table, TableCommit, TableRead, TableScan, TableUpdate,
-    TableWrite, TagManager, WriteBuilder,
+    CommitMessage, DataEvolutionDeleteWriter, DataEvolutionWriter, DataSplit, DataSplitBuilder,
+    DeletionFile, PartitionBucket, Plan, RESTEnv, RESTSnapshotCommit, ReadBuilder,
+    RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager, Table,
+    TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
 };

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -29,7 +28,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
 use paimon::spec::Predicate;
-use paimon::table::Table;
+use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
@@ -57,9 +56,12 @@ pub struct PaimonTableScan {
     /// Whether the pushed predicate is exact (no residual filtering needed).
     /// When true and all splits have known merged_row_count, statistics can be exact.
     filter_exact: bool,
+    /// Metadata-pruning trace captured during eager scan planning.
+    scan_trace: Option<ScanTrace>,
 }
 
 impl PaimonTableScan {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: ArrowSchemaRef,
         table: Table,
@@ -68,6 +70,7 @@ impl PaimonTableScan {
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
         filter_exact: bool,
+        scan_trace: Option<ScanTrace>,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -83,6 +86,7 @@ impl PaimonTableScan {
             plan_properties,
             limit,
             filter_exact,
+            scan_trace,
         }
     }
 
@@ -108,10 +112,6 @@ impl PaimonTableScan {
 impl ExecutionPlan for PaimonTableScan {
     fn name(&self) -> &str {
         "PaimonTableScan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -173,7 +173,7 @@ impl ExecutionPlan for PaimonTableScan {
         )))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         let partitions: &[Arc<[DataSplit]>] = match partition {
             Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
             None => &self.planned_partitions,
@@ -207,11 +207,11 @@ impl ExecutionPlan for PaimonTableScan {
                 Precision::Inexact(total_rows)
             };
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: num_rows_precision,
             total_byte_size: Precision::Inexact(total_bytes),
             column_statistics: Statistics::unknown_column(&self.schema()),
-        })
+        }))
     }
 }
 
@@ -244,6 +244,9 @@ impl DisplayAs for PaimonTableScan {
         }
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
+        }
+        if let Some(ref trace) = self.scan_trace {
+            write!(f, ", trace={trace}")?;
         }
         Ok(())
     }
@@ -290,6 +293,7 @@ mod tests {
             vec![Arc::from(Vec::new())],
             None,
             false,
+            None,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
     }
@@ -310,6 +314,7 @@ mod tests {
             planned_partitions,
             None,
             false,
+            None,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 3);
     }
@@ -387,6 +392,7 @@ mod tests {
             vec![Arc::from(vec![split])],
             None,
             false,
+            None,
         );
 
         let ctx = SessionContext::new();

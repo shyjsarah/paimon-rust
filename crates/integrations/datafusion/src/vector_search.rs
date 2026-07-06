@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -25,7 +24,7 @@ use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
@@ -84,26 +83,11 @@ impl TableFunctionImpl for VectorSearchFunction {
 
         let table_name = extract_string_literal(FUNCTION_NAME, &args[0], "table_name")?;
         let column_name = extract_string_literal(FUNCTION_NAME, &args[1], "column_name")?;
-        let query_vector_json =
-            extract_string_literal(FUNCTION_NAME, &args[2], "query_vector_json")?;
         let limit = extract_int_literal(FUNCTION_NAME, &args[3], "limit")?;
 
         if limit <= 0 {
-            return Err(datafusion::error::DataFusionError::Plan(
+            return Err(DataFusionError::Plan(
                 "vector_search: limit must be positive".to_string(),
-            ));
-        }
-
-        let query_vector: Vec<f32> = serde_json::from_str(&query_vector_json).map_err(|e| {
-            datafusion::error::DataFusionError::Plan(format!(
-                "vector_search: query_vector_json must be a JSON array of floats, got '{}': {}",
-                query_vector_json, e
-            ))
-        })?;
-
-        if query_vector.is_empty() {
-            return Err(datafusion::error::DataFusionError::Plan(
-                "vector_search: query vector cannot be empty".to_string(),
             ));
         }
 
@@ -118,6 +102,32 @@ impl TableFunctionImpl for VectorSearchFunction {
         .map_err(to_datafusion_error)?;
 
         let inner = PaimonTableProvider::try_new(table)?;
+        let query_vector_json =
+            match extract_string_literal(FUNCTION_NAME, &args[2], "query_vector_json") {
+                Ok(value) => value,
+                Err(_) if matches!(args[2], Expr::Column(_)) => {
+                    return Ok(Arc::new(LateralVectorSearchTableProvider {
+                        inner,
+                        column_name,
+                        query_vector_expr: args[2].clone(),
+                        limit: limit as usize,
+                    }));
+                }
+                Err(err) => return Err(err),
+            };
+
+        let query_vector: Vec<f32> = serde_json::from_str(&query_vector_json).map_err(|e| {
+            DataFusionError::Plan(format!(
+                "vector_search: query_vector_json must be a JSON array of floats, got '{}': {}",
+                query_vector_json, e
+            ))
+        })?;
+
+        if query_vector.is_empty() {
+            return Err(DataFusionError::Plan(
+                "vector_search: query vector cannot be empty".to_string(),
+            ));
+        }
 
         Ok(Arc::new(VectorSearchTableProvider {
             inner,
@@ -125,6 +135,55 @@ impl TableFunctionImpl for VectorSearchFunction {
             query_vector,
             limit: limit as usize,
         }))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LateralVectorSearchTableProvider {
+    inner: PaimonTableProvider,
+    column_name: String,
+    query_vector_expr: Expr,
+    limit: usize,
+}
+
+impl LateralVectorSearchTableProvider {
+    pub(crate) fn inner(&self) -> &PaimonTableProvider {
+        &self.inner
+    }
+
+    pub(crate) fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    pub(crate) fn query_vector_expr(&self) -> &Expr {
+        &self.query_vector_expr
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+#[async_trait]
+impl TableProvider for LateralVectorSearchTableProvider {
+    fn schema(&self) -> ArrowSchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan(
+            "lateral vector_search must be planned through a lateral join".to_string(),
+        ))
     }
 }
 
@@ -138,10 +197,6 @@ struct VectorSearchTableProvider {
 
 #[async_trait]
 impl TableProvider for VectorSearchTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> ArrowSchemaRef {
         self.inner.schema()
     }
@@ -188,6 +243,7 @@ impl TableProvider for VectorSearchTableProvider {
             table,
             schema: &self.schema(),
             plan: &plan,
+            scan_trace: None,
             projection,
             pushed_predicate: None,
             limit,

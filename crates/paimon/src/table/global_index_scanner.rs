@@ -22,26 +22,35 @@
 
 use crate::btree::query::{extract_between, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
+use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
-    DataField, DataType, Datum, FileKind, IndexManifestEntry, Predicate, PredicateOperator,
+    DataField, DataType, Datum, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry,
+    Predicate, PredicateOperator,
 };
-use crate::table::RowRange;
+use crate::table::{DeletionFile, RowRange, Table};
 use crate::Result;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync>;
 
-type EvaluateFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<RowRange>>>> + Send + 'a>>;
+type EvaluateFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<GlobalIndexScanResult>>> + Send + 'a>,
+>;
 
 type PredicateTuple<'a> = (PredicateOperator, &'a [Datum], &'a DataType);
 
 const BTREE_INDEX_TYPE: &str = "btree";
+const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 const INDEX_DIR: &str = "index";
+
+struct GlobalIndexScanResult {
+    row_ranges: Vec<RowRange>,
+    evaluated_field_ids: HashSet<i32>,
+}
 
 /// Evaluates global index predicates and returns matching row ranges.
 ///
@@ -54,6 +63,8 @@ pub(crate) struct GlobalIndexScanner {
     table_path: String,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
+    /// Indexed row-id coverage grouped by field_id.
+    coverage_by_field: HashMap<i32, Vec<RowRange>>,
     /// Schema fields for field_id lookup.
     schema_fields: Vec<DataField>,
     /// Cache of opened BTree readers, keyed by file name.
@@ -78,6 +89,7 @@ impl GlobalIndexScanner {
     ) -> Option<Self> {
         let mut entries_by_field: std::collections::HashMap<i32, Vec<GlobalIndexEntry>> =
             std::collections::HashMap::new();
+        let mut coverage_by_field: HashMap<i32, Vec<RowRange>> = HashMap::new();
 
         for entry in index_entries {
             if entry.kind != FileKind::Add {
@@ -103,6 +115,20 @@ impl GlobalIndexScanner {
                 meta: btree_meta,
             };
 
+            let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
+            coverage_by_field
+                .entry(global_meta.index_field_id)
+                .or_default()
+                .push(row_range.clone());
+            if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
+                for extra_field_id in extra_field_ids {
+                    coverage_by_field
+                        .entry(*extra_field_id)
+                        .or_default()
+                        .push(row_range.clone());
+                }
+            }
+
             entries_by_field
                 .entry(global_meta.index_field_id)
                 .or_default()
@@ -117,6 +143,7 @@ impl GlobalIndexScanner {
             file_io: file_io.clone(),
             table_path: table_path.trim_end_matches('/').to_string(),
             entries_by_field: entries_by_field.into_iter().collect(),
+            coverage_by_field,
             schema_fields: schema_fields.to_vec(),
             reader_cache: Mutex::new(HashMap::new()),
         })
@@ -124,7 +151,7 @@ impl GlobalIndexScanner {
 
     /// Evaluate a predicate against the global indexes and return matching row ranges.
     /// Returns `None` if the predicate cannot be evaluated by the global index.
-    pub(crate) fn evaluate<'a>(&'a self, predicate: &'a Predicate) -> EvaluateFuture<'a> {
+    fn evaluate<'a>(&'a self, predicate: &'a Predicate) -> EvaluateFuture<'a> {
         Box::pin(async move {
             match predicate {
                 Predicate::Leaf {
@@ -148,6 +175,12 @@ impl GlobalIndexScanner {
                     };
                     self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)])
                         .await
+                        .map(|ranges| {
+                            ranges.map(|row_ranges| GlobalIndexScanResult {
+                                row_ranges,
+                                evaluated_field_ids: HashSet::from([field_id]),
+                            })
+                        })
                 }
                 Predicate::And(children) => {
                     // Group leaf predicates by field_id to reuse readers
@@ -180,45 +213,61 @@ impl GlobalIndexScanner {
                         non_leaf_children.push(child);
                     }
 
-                    let mut result: Option<Vec<RowRange>> = None;
+                    let mut row_ranges: Option<Vec<RowRange>> = None;
+                    let mut evaluated_field_ids = HashSet::new();
 
                     // Evaluate grouped leaves (one open per file)
                     for (field_id, predicates) in &leaf_groups {
                         if let Some(entries) = self.entries_for_field(*field_id) {
                             if let Some(ranges) = self.evaluate_leaf(entries, predicates).await? {
-                                result = Some(match result {
+                                row_ranges = Some(match row_ranges {
                                     None => ranges,
                                     Some(existing) => intersect_sorted_ranges(&existing, &ranges),
                                 });
+                                evaluated_field_ids.insert(*field_id);
                             }
                         }
                     }
 
                     // Evaluate non-leaf children recursively
                     for child in non_leaf_children {
-                        if let Some(ranges) = self.evaluate(child).await? {
-                            result = Some(match result {
-                                None => ranges,
-                                Some(existing) => intersect_sorted_ranges(&existing, &ranges),
+                        if let Some(child_result) = self.evaluate(child).await? {
+                            row_ranges = Some(match row_ranges {
+                                None => child_result.row_ranges,
+                                Some(existing) => {
+                                    intersect_sorted_ranges(&existing, &child_result.row_ranges)
+                                }
                             });
+                            evaluated_field_ids.extend(child_result.evaluated_field_ids);
                         }
                     }
 
-                    Ok(result)
+                    Ok(row_ranges.map(|row_ranges| GlobalIndexScanResult {
+                        row_ranges,
+                        evaluated_field_ids,
+                    }))
                 }
                 Predicate::Or(children) => {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
+                    let mut evaluated_field_ids = HashSet::new();
                     for child in children {
                         match self.evaluate(child).await? {
-                            Some(ranges) => all_ranges.extend(ranges),
+                            Some(child_result) => {
+                                all_ranges.extend(child_result.row_ranges);
+                                evaluated_field_ids.extend(child_result.evaluated_field_ids);
+                            }
                             None => return Ok(None),
                         }
                     }
-                    if all_ranges.is_empty() {
-                        Ok(Some(Vec::new()))
+                    let row_ranges = if all_ranges.is_empty() {
+                        Vec::new()
                     } else {
-                        Ok(Some(super::merge_row_ranges(all_ranges)))
-                    }
+                        super::merge_row_ranges(all_ranges)
+                    };
+                    Ok(Some(GlobalIndexScanResult {
+                        row_ranges,
+                        evaluated_field_ids,
+                    }))
                 }
                 _ => Ok(None),
             }
@@ -397,6 +446,70 @@ impl GlobalIndexScanner {
             .find(|(id, _)| *id == field_id)
             .map(|(_, entries)| entries.as_slice())
     }
+
+    /// Return row ranges not covered by global indexes for this predicate.
+    ///
+    /// `full` uses `[0, snapshot.next_row_id - 1]`; `detail` uses actual
+    /// data-file row ranges collected by the scan. The caller unions these
+    /// ranges with indexed matches, and the normal read filter evaluates the
+    /// predicate on the raw rows.
+    #[cfg(test)]
+    fn unindexed_ranges(
+        &self,
+        predicate: &Predicate,
+        search_mode: GlobalIndexSearchMode,
+        next_row_id: Option<i64>,
+        data_ranges: &[RowRange],
+    ) -> Result<Vec<RowRange>> {
+        let field_ids = self.collect_field_ids(predicate)?;
+        Ok(self.unindexed_ranges_for_field_ids(&field_ids, search_mode, next_row_id, data_ranges))
+    }
+
+    fn unindexed_ranges_for_field_ids(
+        &self,
+        field_ids: &HashSet<i32>,
+        search_mode: GlobalIndexSearchMode,
+        next_row_id: Option<i64>,
+        data_ranges: &[RowRange],
+    ) -> Vec<RowRange> {
+        unindexed_ranges_for_coverage(
+            &self.coverage_by_field,
+            field_ids,
+            search_mode,
+            next_row_id,
+            data_ranges,
+        )
+    }
+
+    #[cfg(test)]
+    fn collect_field_ids(&self, predicate: &Predicate) -> Result<HashSet<i32>> {
+        let mut field_ids = HashSet::new();
+        self.collect_field_ids_inner(predicate, &mut field_ids)?;
+        Ok(field_ids)
+    }
+
+    #[cfg(test)]
+    fn collect_field_ids_inner(
+        &self,
+        predicate: &Predicate,
+        field_ids: &mut HashSet<i32>,
+    ) -> Result<()> {
+        match predicate {
+            Predicate::Leaf { column, .. } => {
+                if let Some(field_id) = self.find_field_id_by_name(column)? {
+                    field_ids.insert(field_id);
+                }
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                for child in children {
+                    self.collect_field_ids_inner(child, field_ids)?;
+                }
+            }
+            Predicate::Not(inner) => self.collect_field_ids_inner(inner, field_ids)?,
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+        Ok(())
+    }
 }
 
 /// Whether the b-tree global index can evaluate this operator directly.
@@ -455,6 +568,241 @@ fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
     result
 }
 
+fn exclude_row_ranges(data_ranges: &[RowRange], indexed_ranges: &[RowRange]) -> Vec<RowRange> {
+    let data_ranges = super::merge_row_ranges(data_ranges.to_vec());
+    if data_ranges.is_empty() {
+        return Vec::new();
+    }
+    let indexed_ranges = super::merge_row_ranges(indexed_ranges.to_vec());
+    if indexed_ranges.is_empty() {
+        return data_ranges;
+    }
+
+    let mut result = Vec::new();
+    for data_range in data_ranges {
+        let mut cursor = data_range.from();
+        let mut exhausted = false;
+        for indexed_range in &indexed_ranges {
+            if indexed_range.to() < cursor {
+                continue;
+            }
+            if indexed_range.from() > data_range.to() {
+                break;
+            }
+            if indexed_range.from() > cursor {
+                result.push(RowRange::new(cursor, indexed_range.from() - 1));
+            }
+            if indexed_range.to() >= data_range.to() {
+                exhausted = true;
+                break;
+            }
+            cursor = cursor.max(indexed_range.to() + 1);
+        }
+        if !exhausted && cursor <= data_range.to() {
+            result.push(RowRange::new(cursor, data_range.to()));
+        }
+    }
+    super::merge_row_ranges(result)
+}
+
+fn data_ranges_for_search_mode(
+    search_mode: GlobalIndexSearchMode,
+    next_row_id: Option<i64>,
+    data_ranges: &[RowRange],
+) -> Option<Vec<RowRange>> {
+    match search_mode {
+        GlobalIndexSearchMode::Fast => None,
+        GlobalIndexSearchMode::Full => match next_row_id {
+            Some(next_row_id) if next_row_id > 0 => Some(vec![RowRange::new(0, next_row_id - 1)]),
+            _ => None,
+        },
+        GlobalIndexSearchMode::Detail => {
+            if data_ranges.is_empty() {
+                None
+            } else {
+                Some(data_ranges.to_vec())
+            }
+        }
+    }
+}
+
+fn indexed_ranges_from_coverage(
+    coverage_by_field: &HashMap<i32, Vec<RowRange>>,
+    field_ids: &HashSet<i32>,
+) -> Vec<RowRange> {
+    let mut ranges: Option<Vec<RowRange>> = None;
+    for field_id in field_ids {
+        let Some(field_ranges) = coverage_by_field.get(field_id) else {
+            return Vec::new();
+        };
+        if field_ranges.is_empty() {
+            return Vec::new();
+        }
+        let field_ranges = super::merge_row_ranges(field_ranges.clone());
+        ranges = Some(match ranges {
+            None => field_ranges,
+            Some(existing) => intersect_sorted_ranges(&existing, &field_ranges),
+        });
+    }
+    ranges.map(super::merge_row_ranges).unwrap_or_default()
+}
+
+fn unindexed_ranges_for_coverage(
+    coverage_by_field: &HashMap<i32, Vec<RowRange>>,
+    field_ids: &HashSet<i32>,
+    search_mode: GlobalIndexSearchMode,
+    next_row_id: Option<i64>,
+    data_ranges: &[RowRange],
+) -> Vec<RowRange> {
+    let Some(data_ranges) = data_ranges_for_search_mode(search_mode, next_row_id, data_ranges)
+    else {
+        return Vec::new();
+    };
+    let indexed_ranges = indexed_ranges_from_coverage(coverage_by_field, field_ids);
+    exclude_row_ranges(&data_ranges, &indexed_ranges)
+}
+
+/// Compute row ranges not covered by a family of global index files.
+///
+/// This mirrors Java `GlobalIndexCoverage`: `full` compares index coverage
+/// against `[0, snapshot.next_row_id - 1]`, while `detail` compares against
+/// exact data-file row ranges supplied by the caller.
+pub(crate) fn unindexed_ranges_for_global_index_entries(
+    index_entries: &[IndexManifestEntry],
+    field_ids: &HashSet<i32>,
+    search_mode: GlobalIndexSearchMode,
+    next_row_id: Option<i64>,
+    data_ranges: &[RowRange],
+    index_file_filter: impl Fn(&IndexFileMeta) -> bool,
+) -> Vec<RowRange> {
+    let mut coverage_by_field: HashMap<i32, Vec<RowRange>> = HashMap::new();
+    for entry in index_entries {
+        if entry.kind != FileKind::Add || !index_file_filter(&entry.index_file) {
+            continue;
+        }
+        let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
+            continue;
+        };
+        let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
+        coverage_by_field
+            .entry(global_meta.index_field_id)
+            .or_default()
+            .push(row_range.clone());
+        if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
+            for extra_field_id in extra_field_ids {
+                coverage_by_field
+                    .entry(*extra_field_id)
+                    .or_default()
+                    .push(row_range.clone());
+            }
+        }
+    }
+    unindexed_ranges_for_coverage(
+        &coverage_by_field,
+        field_ids,
+        search_mode,
+        next_row_id,
+        data_ranges,
+    )
+}
+
+/// Resolve live deletion-vector index entries into global row-id ranges.
+///
+/// Data-evolution DV entries are keyed by the normal anchor data file. The DV
+/// bitmap positions are local to that anchor file's `first_row_id`, so this
+/// helper joins index metadata with live data-file metadata before converting
+/// deleted positions to global row IDs.
+pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
+    table: &Table,
+    index_entries: &[IndexManifestEntry],
+) -> Result<Vec<RowRange>> {
+    if !index_entries.iter().any(|entry| {
+        entry.kind == FileKind::Add && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE
+    }) {
+        return Ok(Vec::new());
+    }
+
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await?;
+
+    let mut first_row_ids: HashMap<(Vec<u8>, i32, String), i64> = HashMap::new();
+    for split in plan.splits() {
+        let partition = split.partition().to_serialized_bytes();
+        let bucket = split.bucket();
+        for file in split.data_files() {
+            if let Some(first_row_id) = file.first_row_id {
+                first_row_ids.insert(
+                    (partition.clone(), bucket, file.file_name.clone()),
+                    first_row_id,
+                );
+            }
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let table_path = table.location().trim_end_matches('/');
+    for entry in index_entries {
+        if entry.kind != FileKind::Add || entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE
+        {
+            continue;
+        }
+        let Some(dv_ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
+            continue;
+        };
+        let index_path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+        for (data_file_name, meta) in dv_ranges {
+            let key = (
+                entry.partition.clone(),
+                entry.bucket,
+                data_file_name.clone(),
+            );
+            let first_row_id = first_row_ids.get(&key).copied().ok_or_else(|| {
+                crate::Error::DataInvalid {
+                    message: format!(
+                        "Deletion vector references data file '{}' but no live row-tracked file was found",
+                        data_file_name
+                    ),
+                    source: None,
+                }
+            })?;
+            let deletion_file = DeletionFile::new(
+                index_path.clone(),
+                meta.offset as i64,
+                meta.length as i64,
+                meta.cardinality,
+            );
+            let deletion_vector =
+                DeletionVectorFactory::read(table.file_io(), &deletion_file).await?;
+            for deleted in deletion_vector.iter() {
+                let deleted = i64::try_from(deleted).map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "Deleted position {deleted} for data file '{}' exceeds i64::MAX",
+                        data_file_name
+                    ),
+                    source: None,
+                })?;
+                let row_id =
+                    first_row_id
+                        .checked_add(deleted)
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Deleted row id overflows i64 for data file '{}'",
+                                data_file_name
+                            ),
+                            source: None,
+                        })?;
+                ranges.push(RowRange::new(row_id, row_id));
+            }
+        }
+    }
+
+    Ok(super::merge_row_ranges(ranges))
+}
+
 /// Index for row ranges. Stores sorted, non-overlapping ranges and supports
 /// efficient intersection queries via binary search.
 ///
@@ -487,10 +835,22 @@ impl RowRangeIndex {
     }
 
     /// Returns true if the index has any range that intersects `[start, end]`.
-    #[cfg(test)]
     pub fn intersects(&self, start: i64, end: i64) -> bool {
         let candidate = lower_bound(&self.ends, start);
         candidate < self.starts.len() && self.starts[candidate] <= end
+    }
+
+    /// Counts rows in this index that intersect `[start, end]`.
+    pub fn intersection_row_count(&self, start: i64, end: i64) -> usize {
+        if start > end {
+            return 0;
+        }
+        self.intersected_ranges(start, end)
+            .into_iter()
+            .fold(0usize, |total, range| {
+                let len = range.to().saturating_sub(range.from()).saturating_add(1);
+                total.saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+            })
     }
 
     /// Returns the sub-ranges of this index that intersect `[start, end]`,
@@ -531,6 +891,27 @@ impl RowRangeIndex {
     }
 }
 
+pub(crate) fn search_limit_with_deleted_rows(
+    limit: usize,
+    row_range_start: i64,
+    row_range_end: i64,
+    deleted_rows: Option<&RowRangeIndex>,
+) -> usize {
+    let Some(range_len) = row_range_end
+        .checked_sub(row_range_start)
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| usize::try_from(len).ok())
+    else {
+        return limit;
+    };
+
+    let deleted_count = deleted_rows
+        .map(|index| index.intersection_row_count(row_range_start, row_range_end))
+        .unwrap_or(0)
+        .min(range_len);
+    limit.saturating_add(deleted_count).min(range_len)
+}
+
 /// Binary search: find the first index where `sorted[index] >= target`.
 fn lower_bound(sorted: &[i64], target: i64) -> usize {
     let mut left = 0;
@@ -550,22 +931,44 @@ fn lower_bound(sorted: &[i64], target: i64) -> usize {
 /// This is the main entry point for the table scan integration.
 ///
 /// Returns `None` if global index is not available or predicates can't be evaluated.
+pub(crate) struct GlobalIndexEvaluation<'a> {
+    pub(crate) file_io: &'a FileIO,
+    pub(crate) table_path: &'a str,
+    pub(crate) index_entries: &'a [IndexManifestEntry],
+    pub(crate) predicates: &'a [Predicate],
+    pub(crate) schema_fields: &'a [DataField],
+    pub(crate) search_mode: GlobalIndexSearchMode,
+    pub(crate) next_row_id: Option<i64>,
+    pub(crate) data_ranges: &'a [RowRange],
+}
+
 pub(crate) async fn evaluate_global_index(
-    file_io: &FileIO,
-    table_path: &str,
-    index_entries: &[IndexManifestEntry],
-    predicates: &[Predicate],
-    schema_fields: &[DataField],
+    evaluation: GlobalIndexEvaluation<'_>,
 ) -> Result<Option<Vec<RowRange>>> {
-    let scanner =
-        match GlobalIndexScanner::create(file_io, table_path, index_entries, schema_fields) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+    let scanner = match GlobalIndexScanner::create(
+        evaluation.file_io,
+        evaluation.table_path,
+        evaluation.index_entries,
+        evaluation.schema_fields,
+    ) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
 
-    let combined = Predicate::and(predicates.to_vec());
+    let combined = Predicate::and(evaluation.predicates.to_vec());
 
-    scanner.evaluate(&combined).await
+    let scan_result = match scanner.evaluate(&combined).await? {
+        Some(scan_result) => scan_result,
+        None => return Ok(None),
+    };
+    let mut row_ranges = scan_result.row_ranges;
+    row_ranges.extend(scanner.unindexed_ranges_for_field_ids(
+        &scan_result.evaluated_field_ids,
+        evaluation.search_mode,
+        evaluation.next_row_id,
+        evaluation.data_ranges,
+    ));
+    Ok(Some(super::merge_row_ranges(row_ranges)))
 }
 
 #[cfg(test)]
@@ -676,6 +1079,28 @@ mod tests {
     }
 
     #[test]
+    fn test_row_range_index_intersection_row_count() {
+        let idx = RowRangeIndex::create(vec![
+            RowRange::new(10, 20),
+            RowRange::new(30, 40),
+            RowRange::new(50, 60),
+        ]);
+
+        assert_eq!(idx.intersection_row_count(15, 55), 23);
+        assert_eq!(idx.intersection_row_count(21, 29), 0);
+        assert_eq!(idx.intersection_row_count(55, 15), 0);
+    }
+
+    #[test]
+    fn test_search_limit_with_deleted_rows_expands_and_caps() {
+        let idx = RowRangeIndex::create(vec![RowRange::new(2, 4), RowRange::new(8, 10)]);
+
+        assert_eq!(search_limit_with_deleted_rows(5, 0, 19, Some(&idx)), 11);
+        assert_eq!(search_limit_with_deleted_rows(18, 0, 19, Some(&idx)), 20);
+        assert_eq!(search_limit_with_deleted_rows(5, 0, 19, None), 5);
+    }
+
+    #[test]
     fn test_row_range_index_empty() {
         let idx = RowRangeIndex::create(Vec::new());
         assert!(!idx.intersects(0, 100));
@@ -741,6 +1166,201 @@ mod tests {
         )]
     }
 
+    async fn evaluate_global_index_fast(
+        file_io: &FileIO,
+        table_path: &str,
+        entries: &[IndexManifestEntry],
+        predicates: &[Predicate],
+        fields: &[DataField],
+    ) -> Result<Option<Vec<RowRange>>> {
+        super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io,
+            table_path,
+            index_entries: entries,
+            predicates,
+            schema_fields: fields,
+            search_mode: GlobalIndexSearchMode::Fast,
+            next_row_id: None,
+            data_ranges: &[],
+        })
+        .await
+    }
+
+    fn two_field_schema_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(
+                1,
+                "id".to_string(),
+                DataType::Int(crate::spec::IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "value".to_string(),
+                DataType::Int(crate::spec::IntType::new()),
+            ),
+        ]
+    }
+
+    fn int_eq(column: &str, index: usize, value: i32) -> Predicate {
+        Predicate::Leaf {
+            column: column.to_string(),
+            index,
+            data_type: DataType::Int(crate::spec::IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(value)],
+        }
+    }
+
+    #[test]
+    fn test_unindexed_ranges_fast_mode_empty() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let entries = vec![make_global_index_entry("idx", 1, 0, 49, &meta)];
+        let fields = int_schema_fields();
+        let scanner =
+            GlobalIndexScanner::create(&file_io, "memory:/t", &entries, &fields).expect("scanner");
+
+        let ranges = scanner
+            .unindexed_ranges(
+                &int_eq("id", 0, 7),
+                GlobalIndexSearchMode::Fast,
+                Some(100),
+                &[RowRange::new(50, 99)],
+            )
+            .unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_unindexed_ranges_full_uses_snapshot_next_row_id() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let entries = vec![make_global_index_entry("idx", 1, 0, 49, &meta)];
+        let fields = int_schema_fields();
+        let scanner =
+            GlobalIndexScanner::create(&file_io, "memory:/t", &entries, &fields).expect("scanner");
+
+        let ranges = scanner
+            .unindexed_ranges(
+                &int_eq("id", 0, 7),
+                GlobalIndexSearchMode::Full,
+                Some(100),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(ranges, vec![RowRange::new(50, 99)]);
+    }
+
+    #[test]
+    fn test_unindexed_ranges_detail_uses_data_file_ranges() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let entries = vec![make_global_index_entry("idx", 1, 0, 49, &meta)];
+        let fields = int_schema_fields();
+        let scanner =
+            GlobalIndexScanner::create(&file_io, "memory:/t", &entries, &fields).expect("scanner");
+
+        let ranges = scanner
+            .unindexed_ranges(
+                &int_eq("id", 0, 7),
+                GlobalIndexSearchMode::Detail,
+                Some(100),
+                &[
+                    RowRange::new(0, 10),
+                    RowRange::new(40, 60),
+                    RowRange::new(80, 90),
+                ],
+            )
+            .unwrap();
+        assert_eq!(ranges, vec![RowRange::new(50, 60), RowRange::new(80, 90)]);
+    }
+
+    #[test]
+    fn test_unindexed_ranges_uses_all_predicate_field_coverage() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let entries = vec![
+            make_global_index_entry("idx_id", 1, 0, 49, &meta),
+            make_global_index_entry("idx_value", 2, 0, 99, &meta),
+        ];
+        let fields = two_field_schema_fields();
+        let scanner =
+            GlobalIndexScanner::create(&file_io, "memory:/t", &entries, &fields).expect("scanner");
+        let predicate = Predicate::and(vec![int_eq("id", 0, 7), int_eq("value", 1, 8)]);
+
+        let ranges = scanner
+            .unindexed_ranges(&predicate, GlobalIndexSearchMode::Full, Some(100), &[])
+            .unwrap();
+        assert_eq!(ranges, vec![RowRange::new(50, 99)]);
+    }
+
+    #[test]
+    fn test_unindexed_ranges_missing_field_coverage_reads_all_data_ranges() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let entries = vec![make_global_index_entry("idx_id", 1, 0, 49, &meta)];
+        let fields = two_field_schema_fields();
+        let scanner =
+            GlobalIndexScanner::create(&file_io, "memory:/t", &entries, &fields).expect("scanner");
+        let predicate = Predicate::and(vec![int_eq("id", 0, 7), int_eq("value", 1, 8)]);
+
+        let ranges = scanner
+            .unindexed_ranges(&predicate, GlobalIndexSearchMode::Full, Some(100), &[])
+            .unwrap();
+        assert_eq!(ranges, vec![RowRange::new(0, 99)]);
+    }
+
+    #[test]
+    fn test_unindexed_ranges_counts_extra_field_coverage() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let meta = BTreeIndexMeta::new(None, None, false);
+        let mut entry = make_global_index_entry("idx_id_value", 1, 0, 99, &meta);
+        entry
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .extra_field_ids = Some(vec![2]);
+        let fields = two_field_schema_fields();
+        let scanner =
+            GlobalIndexScanner::create(&file_io, "memory:/t", &[entry], &fields).expect("scanner");
+
+        let ranges = scanner
+            .unindexed_ranges(
+                &int_eq("value", 1, 8),
+                GlobalIndexSearchMode::Full,
+                Some(100),
+                &[],
+            )
+            .unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_extra_field_only_without_composite_reader_falls_back() {
+        let (file_io, table_path, file_name, _tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let mut entry = make_global_index_entry(&file_name, 1, 0, 99, &meta);
+        entry
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .extra_field_ids = Some(vec![2]);
+        let fields = two_field_schema_fields();
+        let predicates = vec![int_eq("value", 1, 50)];
+
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &[entry], &predicates, &fields)
+                .await
+                .unwrap();
+        assert!(
+            result.is_none(),
+            "extra-field-only predicates must fall back until composite-key btree reads are supported"
+        );
+    }
+
     #[tokio::test]
     async fn test_evaluate_global_index_eq() {
         let (file_io, table_path, file_name, _tmp) =
@@ -758,11 +1378,125 @@ mod tests {
             literals: vec![Datum::Int(50)],
         }];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(25, 25)]);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_global_index_full_mode_includes_unindexed_tail() {
+        let (file_io, table_path, file_name, _tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let entries = vec![make_global_index_entry(&file_name, 1, 0, 99, &meta)];
+        let fields = int_schema_fields();
+        let predicates = vec![int_eq("id", 0, 50)];
+
+        let result = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            next_row_id: Some(150),
+            data_ranges: &[],
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.unwrap(),
+            vec![RowRange::new(25, 25), RowRange::new(100, 149)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_global_index_and_uses_evaluated_field_coverage_for_raw_fallback() {
+        let src = format!(
+            "{}/testdata/btree/btree_int_100_no_compress.bin",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::copy(&src, index_dir.join("index_part1.bin")).unwrap();
+        std::fs::copy(&src, index_dir.join("index_part2.bin")).unwrap();
+
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+
+        let mut first = make_global_index_entry("index_part1.bin", 1, 0, 49, &meta);
+        first
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .extra_field_ids = Some(vec![2]);
+        let second = make_global_index_entry("index_part2.bin", 1, 50, 99, &meta);
+        let entries = vec![first, second];
+        let fields = two_field_schema_fields();
+
+        let predicates = vec![Predicate::and(vec![
+            int_eq("id", 0, 50),
+            int_eq("value", 1, 8),
+        ])];
+        let result = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            next_row_id: Some(100),
+            data_ranges: &[],
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.unwrap(),
+            vec![RowRange::new(25, 25), RowRange::new(75, 75)],
+            "raw fallback should use only the id field that was actually evaluated; \
+             the unevaluated extra field must not widen or narrow fallback coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_global_index_detail_mode_uses_data_ranges() {
+        let (file_io, table_path, file_name, _tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let entries = vec![make_global_index_entry(&file_name, 1, 0, 99, &meta)];
+        let fields = int_schema_fields();
+        let predicates = vec![int_eq("id", 0, 50)];
+
+        let data_ranges = [RowRange::new(90, 120), RowRange::new(140, 145)];
+        let result = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &file_io,
+            table_path: &table_path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Detail,
+            next_row_id: Some(150),
+            data_ranges: &data_ranges,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                RowRange::new(25, 25),
+                RowRange::new(100, 120),
+                RowRange::new(140, 145),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -791,9 +1525,10 @@ mod tests {
             },
         ];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(5, 10)]);
     }
@@ -815,9 +1550,10 @@ mod tests {
             literals: vec![Datum::Int(0), Datum::Int(50), Datum::Int(198)],
         }];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert_eq!(
             ranges,
@@ -846,9 +1582,10 @@ mod tests {
             literals: vec![Datum::Int(999)],
         }];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert!(ranges.is_empty());
     }
@@ -871,9 +1608,10 @@ mod tests {
             literals: vec![Datum::Int(50)],
         }];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(1025, 1025)]);
     }
@@ -895,9 +1633,10 @@ mod tests {
             literals: vec![Datum::Int(50)],
         }];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         assert!(result.is_none());
     }
 
@@ -972,9 +1711,10 @@ mod tests {
             },
         ];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(22, 26)]);
     }
@@ -1015,9 +1755,10 @@ mod tests {
             },
         ])];
 
-        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
-            .await
-            .unwrap();
+        let result =
+            evaluate_global_index_fast(&file_io, &table_path, &entries, &predicates, &fields)
+                .await
+                .unwrap();
         let ranges = result.unwrap();
         assert!(
             ranges.is_empty(),

@@ -19,7 +19,7 @@
 //!
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
-use crate::table::{Table, TableCommit, TableUpdate, TableWrite};
+use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -92,9 +92,10 @@ impl<'a> WriteBuilder<'a> {
             crate::spec::CoreOptions::new(self.table.schema().options()).try_time_travel_selector();
         if !matches!(selector, Ok(None)) {
             return Err(crate::Error::Unsupported {
-                message: "Cannot write to a table with a time-travel option set \
-                          (scan.version / scan.timestamp-millis)"
-                    .to_string(),
+                message:
+                    "Cannot write to a table with a time-travel option set \
+                          (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
+                        .to_string(),
             });
         }
         let write = TableWrite::new(self.table, self.commit_user.clone())?;
@@ -108,6 +109,11 @@ impl<'a> WriteBuilder<'a> {
     /// Create a new TableUpdate for data-evolution row-id updates.
     pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
         TableUpdate::new(self.table, update_columns)
+    }
+
+    /// Create a new writer for data-evolution row-id deletes.
+    pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
+        DataEvolutionDeleteWriter::new(self.table)
     }
 }
 
