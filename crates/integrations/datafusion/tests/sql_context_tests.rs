@@ -1561,6 +1561,7 @@ async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options()
     let schema = paimon::spec::Schema::builder()
         .column("group", DataType::Int(IntType::with_nullable(false)))
         .column("order", DataType::Int(IntType::with_nullable(false)))
+        .column("a\"b,c", DataType::Int(IntType::new()))
         .column(
             "nested",
             DataType::Row(paimon::spec::RowType::new(vec![
@@ -1589,7 +1590,7 @@ async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options()
             DataType::VarBinary(VarBinaryType::try_new(true, 32).unwrap()),
         )
         .primary_key(vec!["group", "order"])
-        .partition_keys(vec!["group"])
+        .partition_keys(vec!["a\"b,c"])
         .option("comment", "Bob's table")
         .build()
         .expect("schema should build");
@@ -1614,8 +1615,12 @@ async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options()
         "definition should quote primary key identifiers, got: {definition}"
     );
     assert!(
-        definition.contains("PARTITIONED BY (\"group\")"),
-        "definition should quote partition identifiers, got: {definition}"
+        definition.contains("\"a\"\"b,c\" INT"),
+        "definition should escape quoted column identifiers, got: {definition}"
+    );
+    assert!(
+        definition.contains("PARTITIONED BY (\"a\"\"b,c\")"),
+        "definition should escape quoted partition identifiers, got: {definition}"
     );
     assert!(
         definition.contains("STRUCT<\"from\" VARCHAR"),
