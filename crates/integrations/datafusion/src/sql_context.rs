@@ -49,20 +49,21 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    AlterTableOperation, ColumnDef, CreateTable, CreateTableOptions, CreateView, Delete,
-    Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
-    ResetStatement, Set, SqlOption, Statement, TableFactor, TableObject, Truncate, Update,
-    Value as SqlValue,
+    AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, CreateTable, CreateTableOptions,
+    CreateView, Delete, Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType,
+    RenameTableNameKind, Reset, ResetStatement, Set, SqlOption, Statement, TableFactor,
+    TableObject, Truncate, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use futures::StreamExt;
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::{
-    ArrayType as PaimonArrayType, BigIntType, BlobType, BooleanType, DataField as PaimonDataField,
-    DataType as PaimonDataType, DateType, Datum, DecimalType, DoubleType, FloatType, IntType,
-    LocalZonedTimestampType, MapType as PaimonMapType, RowType as PaimonRowType, SchemaChange,
-    SmallIntType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
+    ArrayType as PaimonArrayType, BigIntType, BinaryType, BlobType, BooleanType, CharType,
+    DataField as PaimonDataField, DataType as PaimonDataType, DateType, Datum, DecimalType,
+    DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType as PaimonMapType,
+    RowType as PaimonRowType, SchemaChange, SmallIntType, TimestampType, TinyIntType,
+    VarBinaryType, VarCharType, VariantType,
 };
 
 use crate::error::to_datafusion_error;
@@ -1634,6 +1635,38 @@ fn primary_key_column_name(expr: &SqlExpr) -> String {
     }
 }
 
+fn character_length_or_default(
+    length: &Option<CharacterLength>,
+    default_length: u32,
+) -> DFResult<u32> {
+    match length {
+        Some(CharacterLength::IntegerLength { length, .. }) => (*length).try_into().map_err(|_| {
+            DataFusionError::Plan(format!("Character length {length} exceeds supported range"))
+        }),
+        Some(CharacterLength::Max) => Ok(VarCharType::MAX_LENGTH),
+        None => Ok(default_length),
+    }
+}
+
+fn u64_length_or_default(length: Option<u64>, default_length: usize) -> DFResult<usize> {
+    match length {
+        Some(length) => length.try_into().map_err(|_| {
+            DataFusionError::Plan(format!("Binary length {length} exceeds supported range"))
+        }),
+        None => Ok(default_length),
+    }
+}
+
+fn binary_length_or_default(length: &Option<BinaryLength>, default_length: u32) -> DFResult<u32> {
+    match length {
+        Some(BinaryLength::IntegerLength { length }) => (*length).try_into().map_err(|_| {
+            DataFusionError::Plan(format!("Binary length {length} exceeds supported range"))
+        }),
+        Some(BinaryLength::Max) => Ok(VarBinaryType::MAX_LENGTH),
+        None => Ok(default_length),
+    }
+}
+
 fn column_def_nullable(col: &ColumnDef) -> bool {
     !col.options.iter().any(|opt| {
         matches!(
@@ -1675,21 +1708,39 @@ fn sql_data_type_to_paimon_type(
         SqlType::Double(_) | SqlType::DoublePrecision => {
             Ok(PaimonDataType::Double(DoubleType::with_nullable(nullable)))
         }
-        SqlType::Varchar(_)
-        | SqlType::CharVarying(_)
-        | SqlType::Text
-        | SqlType::String(_)
-        | SqlType::Char(_)
-        | SqlType::Character(_) => Ok(PaimonDataType::VarChar(
+        SqlType::Char(length) | SqlType::Character(length) => Ok(PaimonDataType::Char(
+            CharType::with_nullable(nullable, character_length_or_default(length, 1)? as usize)
+                .map_err(to_datafusion_error)?,
+        )),
+        SqlType::Varchar(length)
+        | SqlType::Nvarchar(length)
+        | SqlType::CharVarying(length)
+        | SqlType::CharacterVarying(length) => Ok(PaimonDataType::VarChar(
+            VarCharType::with_nullable(
+                nullable,
+                character_length_or_default(length, VarCharType::MAX_LENGTH)?,
+            )
+            .map_err(to_datafusion_error)?,
+        )),
+        SqlType::Text | SqlType::String(_) => Ok(PaimonDataType::VarChar(
             VarCharType::with_nullable(nullable, VarCharType::MAX_LENGTH)
                 .map_err(to_datafusion_error)?,
         )),
-        SqlType::Binary(_) | SqlType::Varbinary(_) | SqlType::Bytea => {
-            Ok(PaimonDataType::VarBinary(
-                VarBinaryType::try_new(nullable, VarBinaryType::MAX_LENGTH)
-                    .map_err(to_datafusion_error)?,
-            ))
-        }
+        SqlType::Binary(length) => Ok(PaimonDataType::Binary(
+            BinaryType::with_nullable(nullable, u64_length_or_default(*length, 1)? as usize)
+                .map_err(to_datafusion_error)?,
+        )),
+        SqlType::Varbinary(length) => Ok(PaimonDataType::VarBinary(
+            VarBinaryType::try_new(
+                nullable,
+                binary_length_or_default(length, VarBinaryType::MAX_LENGTH)?,
+            )
+            .map_err(to_datafusion_error)?,
+        )),
+        SqlType::Bytea => Ok(PaimonDataType::VarBinary(
+            VarBinaryType::try_new(nullable, VarBinaryType::MAX_LENGTH)
+                .map_err(to_datafusion_error)?,
+        )),
         SqlType::Blob(_) => Ok(PaimonDataType::Blob(BlobType::with_nullable(nullable))),
         SqlType::Custom(name, modifiers)
             if name.to_string().eq_ignore_ascii_case("VARIANT") && modifiers.is_empty() =>
@@ -2829,7 +2880,7 @@ mod tests {
 
     #[test]
     fn test_sql_type_string_variants() {
-        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        use datafusion::sql::sqlparser::ast::{CharacterLength, DataType as SqlType};
         for sql_type in [SqlType::Varchar(None), SqlType::Text, SqlType::String(None)] {
             assert_sql_type_to_paimon(
                 sql_type.clone(),
@@ -2838,16 +2889,38 @@ mod tests {
                 ),
             );
         }
+        assert_sql_type_to_paimon(
+            SqlType::Char(Some(CharacterLength::IntegerLength {
+                length: 7,
+                unit: None,
+            })),
+            PaimonDataType::Char(CharType::with_nullable(true, 7).unwrap()),
+        );
+        assert_sql_type_to_paimon(
+            SqlType::Varchar(Some(CharacterLength::IntegerLength {
+                length: 42,
+                unit: None,
+            })),
+            PaimonDataType::VarChar(VarCharType::with_nullable(true, 42).unwrap()),
+        );
     }
 
     #[test]
     fn test_sql_type_binary() {
-        use datafusion::sql::sqlparser::ast::DataType as SqlType;
+        use datafusion::sql::sqlparser::ast::{BinaryLength, DataType as SqlType};
         assert_sql_type_to_paimon(
             SqlType::Bytea,
             PaimonDataType::VarBinary(
                 VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
             ),
+        );
+        assert_sql_type_to_paimon(
+            SqlType::Binary(Some(8)),
+            PaimonDataType::Binary(BinaryType::with_nullable(true, 8).unwrap()),
+        );
+        assert_sql_type_to_paimon(
+            SqlType::Varbinary(Some(BinaryLength::IntegerLength { length: 32 })),
+            PaimonDataType::VarBinary(VarBinaryType::try_new(true, 32).unwrap()),
         );
     }
 

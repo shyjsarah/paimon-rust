@@ -23,8 +23,9 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
 use paimon::catalog::Identifier;
 use paimon::spec::{
-    ArrayType, BlobType, DataType, FloatType, IntType, LocalZonedTimestampType, MapType,
-    MultisetType, TimeType, VarCharType, VectorType,
+    ArrayType, BinaryType, BlobType, CharType, DataType, FloatType, IntType,
+    LocalZonedTimestampType, MapType, MultisetType, TimeType, VarBinaryType, VarCharType,
+    VectorType,
 };
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
@@ -1574,6 +1575,19 @@ async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options()
             "ts_ltz",
             DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
         )
+        .column("fixed_char", DataType::Char(CharType::new(7).unwrap()))
+        .column(
+            "bounded_varchar",
+            DataType::VarChar(VarCharType::new(42).unwrap()),
+        )
+        .column(
+            "fixed_binary",
+            DataType::Binary(BinaryType::new(8).unwrap()),
+        )
+        .column(
+            "bounded_varbinary",
+            DataType::VarBinary(VarBinaryType::try_new(true, 32).unwrap()),
+        )
         .primary_key(vec!["group", "order"])
         .partition_keys(vec!["group"])
         .option("comment", "Bob's table")
@@ -1614,6 +1628,22 @@ async fn test_show_create_table_round_trip_with_quoted_identifiers_and_options()
     assert!(
         definition.contains("\"ts_ltz\" TIMESTAMP(3) WITH TIME ZONE"),
         "definition should render TIMESTAMP WITH TIME ZONE for LTZ, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"fixed_char\" CHAR(7)"),
+        "definition should preserve CHAR length, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"bounded_varchar\" VARCHAR(42)"),
+        "definition should preserve VARCHAR length, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"fixed_binary\" BINARY(8)"),
+        "definition should preserve BINARY length, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"bounded_varbinary\" VARBINARY(32)"),
+        "definition should preserve VARBINARY length, got: {definition}"
     );
 
     catalog
