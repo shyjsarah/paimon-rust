@@ -395,10 +395,11 @@ impl SchemaProvider for PaimonSchemaProvider {
                             .await
                             .map_err(to_datafusion_error)?
                     };
+                    blob_reader_registry
+                        .register_if_absent(table.location().to_string(), table.file_io().clone());
                     let provider = PaimonTableProvider::try_new_with_persisted_table_definition(
                         table,
                         table_definition,
-                        blob_reader_registry,
                     )?;
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
                 }

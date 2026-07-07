@@ -100,10 +100,7 @@ impl PaimonTableProvider {
     pub(crate) fn try_new_with_persisted_table_definition(
         table: Table,
         table_definition: String,
-        blob_reader_registry: BlobReaderRegistry,
     ) -> DFResult<Self> {
-        blob_reader_registry
-            .register_if_absent(table.location().to_string(), table.file_io().clone());
         let fields = datafusion_read_fields(&table);
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
