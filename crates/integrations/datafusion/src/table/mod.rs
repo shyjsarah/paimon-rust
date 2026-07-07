@@ -92,23 +92,21 @@ impl PaimonTableProvider {
         table: Table,
         blob_reader_registry: BlobReaderRegistry,
     ) -> DFResult<Self> {
-        blob_reader_registry
-            .register_if_absent(table.location().to_string(), table.file_io().clone());
-        Self::try_new(table)
+        Self::try_new_with_blob_reader_registry_and_definition(table, blob_reader_registry, None)
     }
 
-    pub(crate) fn try_new_with_persisted_table_definition(
+    pub(crate) fn try_new_with_blob_reader_registry_and_definition(
         table: Table,
-        table_definition: String,
+        blob_reader_registry: BlobReaderRegistry,
+        table_definition: Option<String>,
     ) -> DFResult<Self> {
-        let fields = datafusion_read_fields(&table);
-        let schema =
-            paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
-        Ok(Self {
-            table,
-            schema,
-            table_definition,
-        })
+        blob_reader_registry
+            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        let mut provider = Self::try_new(table)?;
+        if let Some(table_definition) = table_definition {
+            provider.table_definition = table_definition;
+        }
+        Ok(provider)
     }
 
     pub fn table(&self) -> &Table {
