@@ -382,6 +382,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         await_with_runtime(async move {
             match catalog.get_table(&identifier).await {
                 Ok(table) => {
+                    let table_definition = crate::table::create_table_definition(&table);
                     let opts = dynamic_options.read().unwrap().clone();
                     let table = if opts.is_empty() {
                         table
@@ -394,8 +395,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                             .await
                             .map_err(to_datafusion_error)?
                     };
-                    let provider = PaimonTableProvider::try_new_with_blob_reader_registry(
+                    let provider =
+                        PaimonTableProvider::try_new_with_table_definition_and_blob_reader_registry(
                         table,
+                        table_definition,
                         blob_reader_registry,
                     )?;
                     Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))

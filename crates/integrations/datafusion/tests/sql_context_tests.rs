@@ -56,6 +56,58 @@ async fn test_show_tables_is_enabled() {
         .expect("SHOW TABLES should execute");
 }
 
+#[tokio::test]
+async fn test_show_create_table_excludes_session_dynamic_options() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t (
+                id INT,
+                name VARCHAR,
+                dt STRING,
+                PRIMARY KEY (id)
+            ) PARTITIONED BY (dt) WITH ('bucket' = '1')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+    sql_context
+        .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+        .await
+        .expect("SET should succeed");
+
+    let batches = sql_context
+        .sql("SHOW CREATE TABLE paimon.test_db.t")
+        .await
+        .expect("SHOW CREATE TABLE should plan")
+        .collect()
+        .await
+        .expect("SHOW CREATE TABLE should execute");
+    let definition = batches[0]
+        .column_by_name("definition")
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+        })
+        .expect("definition column")
+        .value(0);
+
+    assert!(definition.contains("CREATE TABLE"));
+    assert!(definition.contains("'bucket' = '1'"));
+    assert!(definition.contains("PRIMARY KEY"));
+    assert!(definition.contains("PARTITIONED BY"));
+    assert!(
+        !definition.contains("blob-as-descriptor"),
+        "SHOW CREATE TABLE should not include session dynamic options: {definition}"
+    );
+}
+
 // ======================= CREATE / DROP SCHEMA =======================
 
 #[tokio::test]

@@ -28,6 +28,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use paimon::spec::{escape_identifier, escape_single_quotes, DataType};
 use paimon::table::Table;
 
 use crate::physical_plan::PaimonDataSink;
@@ -53,6 +54,7 @@ use crate::runtime::await_with_runtime;
 pub struct PaimonTableProvider {
     table: Table,
     schema: ArrowSchemaRef,
+    table_definition: String,
 }
 
 impl PaimonTableProvider {
@@ -71,7 +73,12 @@ impl PaimonTableProvider {
         }
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
-        Ok(Self { table, schema })
+        let table_definition = create_table_definition(&table);
+        Ok(Self {
+            table,
+            schema,
+            table_definition,
+        })
     }
 
     pub fn try_new_with_blob_reader_registry(
@@ -83,8 +90,135 @@ impl PaimonTableProvider {
         Self::try_new(table)
     }
 
+    pub(crate) fn try_new_with_table_definition_and_blob_reader_registry(
+        table: Table,
+        table_definition: String,
+        blob_reader_registry: BlobReaderRegistry,
+    ) -> DFResult<Self> {
+        blob_reader_registry
+            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        let mut provider = Self::try_new(table)?;
+        provider.table_definition = table_definition;
+        Ok(provider)
+    }
+
     pub fn table(&self) -> &Table {
         &self.table
+    }
+}
+
+pub(crate) fn create_table_definition(table: &Table) -> String {
+    let schema = table.schema();
+    let mut lines: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            format!(
+                "  \"{}\" {}",
+                escape_identifier(field.name()),
+                data_type_to_sql(field.data_type())
+            )
+        })
+        .collect();
+
+    if !schema.primary_keys().is_empty() {
+        let keys = schema
+            .primary_keys()
+            .iter()
+            .map(|key| format!("\"{}\"", escape_identifier(key)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("  PRIMARY KEY ({keys})"));
+    }
+
+    let table_name = format!(
+        "\"{}\".\"{}\"",
+        escape_identifier(table.identifier().database()),
+        escape_identifier(table.identifier().object())
+    );
+    let mut ddl = format!("CREATE TABLE {table_name} (\n{}\n)", lines.join(",\n"));
+
+    if !schema.partition_keys().is_empty() {
+        let partitions = schema
+            .partition_keys()
+            .iter()
+            .map(|key| format!("\"{}\"", escape_identifier(key)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ddl.push_str(&format!(" PARTITIONED BY ({partitions})"));
+    }
+
+    if !schema.options().is_empty() {
+        let mut options = schema.options().iter().collect::<Vec<_>>();
+        options.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let option_sql = options
+            .into_iter()
+            .map(|(key, value)| {
+                format!(
+                    "'{}' = '{}'",
+                    escape_single_quotes(key),
+                    escape_single_quotes(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ddl.push_str(&format!(" WITH ({option_sql})"));
+    }
+
+    ddl
+}
+
+fn data_type_to_sql(data_type: &DataType) -> String {
+    let type_sql = match data_type {
+        DataType::Boolean(_) => "BOOLEAN".to_string(),
+        DataType::TinyInt(_) => "TINYINT".to_string(),
+        DataType::SmallInt(_) => "SMALLINT".to_string(),
+        DataType::Int(_) => "INT".to_string(),
+        DataType::BigInt(_) => "BIGINT".to_string(),
+        DataType::Float(_) => "FLOAT".to_string(),
+        DataType::Double(_) => "DOUBLE".to_string(),
+        DataType::Binary(binary) => binary.to_string(),
+        DataType::VarBinary(varbinary) => varbinary.to_string(),
+        DataType::Variant(_) => "VARIANT".to_string(),
+        DataType::Blob(_) => "BLOB".to_string(),
+        DataType::Char(char_type) => char_type.to_string(),
+        DataType::VarChar(varchar) => varchar.to_string(),
+        DataType::Date(_) => "DATE".to_string(),
+        DataType::LocalZonedTimestamp(timestamp) => timestamp.to_string(),
+        DataType::Time(time) => time.to_string(),
+        DataType::Timestamp(timestamp) => timestamp.to_string(),
+        DataType::Decimal(decimal) => decimal.to_string(),
+        DataType::Array(array) => format!("ARRAY<{}>", data_type_to_sql(array.element_type())),
+        DataType::Map(map) => format!(
+            "MAP<{}, {}>",
+            data_type_to_sql(map.key_type()),
+            data_type_to_sql(map.value_type())
+        ),
+        DataType::Multiset(multiset) => {
+            format!("MULTISET<{}>", data_type_to_sql(multiset.element_type()))
+        }
+        DataType::Row(row) => {
+            let fields = row
+                .fields()
+                .iter()
+                .map(|field| {
+                    format!(
+                        "\"{}\" {}",
+                        escape_identifier(field.name()),
+                        data_type_to_sql(field.data_type())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("STRUCT<{fields}>")
+        }
+        DataType::Vector(vector) => vector.to_string(),
+    };
+
+    if data_type.is_nullable() || type_sql.ends_with(" NOT NULL") {
+        type_sql
+    } else {
+        format!("{type_sql} NOT NULL")
     }
 }
 
@@ -162,6 +296,10 @@ impl TableProvider for PaimonTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        Some(&self.table_definition)
     }
 
     async fn scan(
