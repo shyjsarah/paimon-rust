@@ -1381,6 +1381,44 @@ async fn test_show_create_table_with_partition_and_options() {
 }
 
 #[tokio::test]
+async fn test_show_create_table_excludes_session_dynamic_options() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) \
+             PARTITIONED BY (pt) WITH ('bucket' = '4')",
+        )
+        .await
+        .expect("CREATE TABLE should succeed");
+    sql_context
+        .sql("SET 'paimon.scan.version' = '1'")
+        .await
+        .expect("SET scan.version should succeed");
+    sql_context
+        .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+        .await
+        .expect("SET blob-as-descriptor should succeed");
+
+    let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
+    assert!(
+        definition.contains("'bucket' = '4'"),
+        "definition should keep persisted table options, got: {definition}"
+    );
+    for dynamic_option in ["scan.version", "blob-as-descriptor"] {
+        assert!(
+            !definition.contains(dynamic_option),
+            "definition should not contain session dynamic option {dynamic_option}, got: {definition}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_show_create_table_various_types() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog).await;

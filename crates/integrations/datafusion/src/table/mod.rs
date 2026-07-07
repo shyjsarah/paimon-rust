@@ -97,6 +97,23 @@ impl PaimonTableProvider {
         Self::try_new(table)
     }
 
+    pub(crate) fn try_new_with_persisted_table_definition(
+        table: Table,
+        table_definition: String,
+        blob_reader_registry: BlobReaderRegistry,
+    ) -> DFResult<Self> {
+        blob_reader_registry
+            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        let fields = datafusion_read_fields(&table);
+        let schema =
+            paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
+        Ok(Self {
+            table,
+            schema,
+            table_definition,
+        })
+    }
+
     pub fn table(&self) -> &Table {
         &self.table
     }
@@ -106,7 +123,7 @@ impl PaimonTableProvider {
 ///
 /// Mirrors the syntax accepted by `SQLContext::handle_create_table`:
 /// `CREATE TABLE <db>.<table> (<col> <type>, ..., PRIMARY KEY (...)) [PARTITIONED BY (...)] [WITH ('k'='v', ...)]`.
-fn build_table_definition(table: &Table) -> DFResult<String> {
+pub(crate) fn build_table_definition(table: &Table) -> DFResult<String> {
     let identifier = table.identifier();
     let schema = table.schema();
     let mut ddl = String::new();
