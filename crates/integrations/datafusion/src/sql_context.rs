@@ -51,8 +51,8 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     AlterTableOperation, BinaryLength, CharacterLength, ColumnDef, CreateTable, CreateTableOptions,
     CreateView, Delete, Expr as SqlExpr, FromTable, Insert, Merge, ObjectName, ObjectType,
-    RenameTableNameKind, Reset, ResetStatement, Set, SqlOption, Statement, TableFactor,
-    TableObject, Truncate, Update, Value as SqlValue,
+    RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption, Statement,
+    TableFactor, TableObject, Truncate, Update, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -368,6 +368,10 @@ impl SQLContext {
                         .await
                 }
             }
+            Statement::ShowCreate {
+                obj_type: ShowCreateObject::Table,
+                obj_name,
+            } => self.handle_show_create_table(sql, obj_name).await,
             Statement::AlterTable(alter_table) => {
                 let (catalog, _catalog_name, _) =
                     self.resolve_catalog_and_table(&alter_table.name)?;
@@ -859,6 +863,33 @@ impl SQLContext {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         }
         ok_result(&self.ctx)
+    }
+
+    async fn handle_show_create_table(&self, sql: &str, name: &ObjectName) -> DFResult<DataFrame> {
+        let (catalog, catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
+        let table = match catalog.get_table(&identifier).await {
+            Ok(table) => table,
+            Err(paimon::Error::TableNotExist { .. }) => return self.ctx.sql(sql).await,
+            Err(e) => return Err(to_datafusion_error(e)),
+        };
+        let definition = crate::table::build_table_definition(&table)?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("table_catalog", ArrowDataType::Utf8, false),
+            Field::new("table_schema", ArrowDataType::Utf8, false),
+            Field::new("table_name", ArrowDataType::Utf8, false),
+            Field::new("definition", ArrowDataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![catalog_name])),
+                Arc::new(StringArray::from(vec![identifier.database().to_string()])),
+                Arc::new(StringArray::from(vec![identifier.object().to_string()])),
+                Arc::new(StringArray::from(vec![definition])),
+            ],
+        )?;
+        self.ctx.read_batch(batch)
     }
 
     async fn handle_alter_table(

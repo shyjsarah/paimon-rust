@@ -1392,12 +1392,27 @@ async fn test_show_create_table_excludes_session_dynamic_options() {
     sql_context
         .sql(
             "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) \
-             PARTITIONED BY (pt) WITH ('bucket' = '4')",
+             PARTITIONED BY (pt) WITH ('file.format' = 'parquet')",
         )
         .await
         .expect("CREATE TABLE should succeed");
     sql_context
-        .sql("SET 'paimon.scan.version' = '1'")
+        .sql("INSERT INTO paimon.test_db.t VALUES (1, 'one', 1)")
+        .await
+        .expect("INSERT should plan")
+        .collect()
+        .await
+        .expect("INSERT should execute");
+    sql_context
+        .sql("CALL sys.create_tag(table => 'test_db.t', tag => 'before_age')")
+        .await
+        .expect("CREATE TAG should succeed");
+    sql_context
+        .sql("ALTER TABLE paimon.test_db.t ADD COLUMN age INT")
+        .await
+        .expect("ALTER TABLE should succeed");
+    sql_context
+        .sql("SET 'paimon.scan.version' = 'before_age'")
         .await
         .expect("SET scan.version should succeed");
     sql_context
@@ -1407,8 +1422,12 @@ async fn test_show_create_table_excludes_session_dynamic_options() {
 
     let definition = collect_definition(&sql_context, "paimon.test_db.t").await;
     assert!(
-        definition.contains("'bucket' = '4'"),
+        definition.contains("'file.format' = 'parquet'"),
         "definition should keep persisted table options, got: {definition}"
+    );
+    assert!(
+        definition.contains("\"age\" INT"),
+        "definition should use current persisted schema, got: {definition}"
     );
     for dynamic_option in ["scan.version", "blob-as-descriptor"] {
         assert!(
@@ -1462,12 +1481,14 @@ async fn test_dynamic_scan_ignores_current_show_create_unsupported_type() {
         .expect("SET scan.version should succeed");
 
     let rows = sql_context
-        .sql("SELECT id FROM paimon.test_db.t")
+        .sql("SELECT * FROM paimon.test_db.t")
         .await
         .expect("dynamic scan should plan with historical schema")
         .collect()
         .await
         .expect("dynamic scan should execute");
+    assert_eq!(rows[0].schema().fields().len(), 1);
+    assert_eq!(rows[0].schema().field(0).name(), "id");
     let row_count: usize = rows.iter().map(|batch| batch.num_rows()).sum();
     assert_eq!(row_count, 1);
 }
@@ -1795,6 +1816,11 @@ async fn test_show_create_table_rejects_non_round_trippable_types() {
             .create_table(&identifier, schema, false)
             .await
             .expect("table should be created");
+
+        sql_context
+            .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+            .await
+            .expect("SET blob-as-descriptor should succeed");
 
         let err = sql_context
             .sql(&format!("SHOW CREATE TABLE paimon.test_db.{table_name}"))
