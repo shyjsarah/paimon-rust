@@ -29,7 +29,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{BinaryRow, DataField, ManifestFileMeta, ManifestList};
-use paimon::table::{SnapshotManager, Table};
+use paimon::table::Table;
 
 use super::row_string_cast::format_row_as_java_cast_string;
 use crate::error::to_datafusion_error;
@@ -160,7 +160,7 @@ impl TableProvider for ManifestsTable {
 
 async fn collect_manifests(table: &Table) -> paimon::Result<Vec<ManifestFileMeta>> {
     let file_io = table.file_io();
-    let sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
+    let sm = table.snapshot_manager();
     let snapshot = match sm.get_latest_snapshot().await? {
         Some(s) => s,
         None => return Ok(Vec::new()),

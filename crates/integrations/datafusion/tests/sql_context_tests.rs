@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::Int64Array;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
 use paimon::catalog::Identifier;
@@ -27,6 +28,7 @@ use paimon::spec::{
     LocalZonedTimestampType, MapType, MultisetType, SchemaChange, TimeType, VarBinaryType,
     VarCharType, VectorType,
 };
+use paimon::table::{BranchManager, SnapshotManager, TagManager};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
@@ -46,6 +48,53 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     ctx
 }
 
+async fn collect_ids(sql_context: &SQLContext, sql: &str) -> Vec<i32> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut ids = Vec::new();
+    for batch in batches {
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id column");
+        for row in 0..batch.num_rows() {
+            ids.push(id_array.value(row));
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+async fn collect_i64_column(sql_context: &SQLContext, sql: &str, column: &str) -> Vec<i64> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(column)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect(column);
+        for row in 0..batch.num_rows() {
+            values.push(array.value(row));
+        }
+    }
+    values.sort_unstable();
+    values
+}
+
+async fn assert_sql_error_contains(sql_context: &SQLContext, sql: &str, expected: &str) {
+    let err = match sql_context.sql(sql).await {
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("SQL should fail but succeeded")
+            .to_string(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains(expected),
+        "expected error containing '{expected}', got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_show_tables_is_enabled() {
     let (_tmp, catalog) = create_test_env();
@@ -58,6 +107,127 @@ async fn test_show_tables_is_enabled() {
         .collect()
         .await
         .expect("SHOW TABLES should execute");
+}
+
+#[tokio::test]
+async fn test_select_branch_table_reads_branch_snapshot() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql("CREATE TABLE paimon.default.branch_orders (id INT, name STRING)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_orders VALUES (1, 'branch')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let identifier = Identifier::new("default", "branch_orders");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let tag_manager = TagManager::new(table.file_io().clone(), table.location().to_string());
+    tag_manager.create("branch_base", &snapshot).await.unwrap();
+    let branch_manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    branch_manager
+        .create_branch_from_tag("b1", "branch_base")
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_orders VALUES (2, 'main')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_ids(&sql_context, "SELECT id FROM paimon.default.branch_orders").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        collect_ids(
+            &sql_context,
+            "SELECT id FROM paimon.default.branch_orders$branch_b1"
+        )
+        .await,
+        vec![1]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT snapshot_id FROM paimon.default.branch_orders$snapshots",
+            "snapshot_id"
+        )
+        .await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT snapshot_id FROM paimon.default.branch_orders$branch_b1$snapshots",
+            "snapshot_id"
+        )
+        .await,
+        vec![1]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT record_count FROM paimon.default.branch_orders$files VERSION AS OF 'branch_base'",
+            "record_count"
+        )
+        .await,
+        vec![1]
+    );
+    assert_eq!(
+        collect_i64_column(
+            &sql_context,
+            "SELECT record_count FROM paimon.default.branch_orders$branch_b1$files VERSION AS OF 'branch_base'",
+            "record_count"
+        )
+        .await,
+        vec![1]
+    );
+
+    let branch_table = table.copy_with_branch("b1").await.unwrap();
+    let write_builder = branch_table.new_write_builder();
+    assert!(write_builder.new_write().is_err());
+    assert!(write_builder.new_update(vec!["name".to_string()]).is_err());
+    assert!(write_builder.new_delete().is_err());
+    assert!(write_builder.new_commit().is_err());
+
+    assert_sql_error_contains(
+        &sql_context,
+        "INSERT INTO paimon.default.branch_orders$branch_b1 VALUES (3, 'blocked')",
+        "Writing to Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "UPDATE paimon.default.branch_orders$branch_b1 SET name = 'blocked' WHERE id = 1",
+        "UPDATE on Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "DELETE FROM paimon.default.branch_orders$branch_b1 WHERE id = 1",
+        "DELETE on Paimon branch 'b1' is not supported",
+    )
+    .await;
 }
 
 // ======================= CREATE / DROP SCHEMA =======================

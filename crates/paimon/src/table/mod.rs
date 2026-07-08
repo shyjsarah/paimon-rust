@@ -106,7 +106,7 @@ pub use vector_search_builder::{BatchVectorSearchBuilder, VectorSearchBuilder};
 pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
-use crate::catalog::Identifier;
+use crate::catalog::{Identifier, DEFAULT_MAIN_BRANCH};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
@@ -119,6 +119,7 @@ pub struct Table {
     location: String,
     schema: TableSchema,
     schema_manager: SchemaManager,
+    branch: String,
     rest_env: Option<RESTEnv>,
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
@@ -139,12 +140,14 @@ impl Table {
         rest_env: Option<RESTEnv>,
     ) -> Self {
         let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
+        let branch = DEFAULT_MAIN_BRANCH.to_string();
         Self {
             file_io,
             identifier,
             location,
             schema,
             schema_manager,
+            branch,
             rest_env,
             time_traveled: false,
             travel_snapshot: None,
@@ -174,6 +177,32 @@ impl Table {
     /// Get the SchemaManager for this table.
     pub fn schema_manager(&self) -> &SchemaManager {
         &self.schema_manager
+    }
+
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    pub fn is_main_branch(&self) -> bool {
+        self.branch == DEFAULT_MAIN_BRANCH
+    }
+
+    pub fn snapshot_manager(&self) -> SnapshotManager {
+        let manager = SnapshotManager::new(self.file_io.clone(), self.location.clone());
+        if self.is_main_branch() {
+            manager
+        } else {
+            manager.with_branch(&self.branch)
+        }
+    }
+
+    pub fn tag_manager(&self) -> TagManager {
+        let manager = TagManager::new(self.file_io.clone(), self.location.clone());
+        if self.is_main_branch() {
+            manager
+        } else {
+            manager.with_branch(&self.branch)
+        }
     }
 
     /// Get the REST environment, if this table was loaded from a REST catalog.
@@ -257,6 +286,7 @@ impl Table {
             location: self.location.clone(),
             schema: self.schema.copy_with_options(extra),
             schema_manager: self.schema_manager.clone(),
+            branch: self.branch.clone(),
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
             travel_snapshot: if selector_changed {
@@ -287,9 +317,12 @@ impl Table {
         CoreOptions::new(table.schema().options()).validate_scan_options()?;
         // travel_to_snapshot returns Ok(None) without IO when the merged
         // options contain no selector.
-        if let Ok(Some(snapshot)) =
-            time_travel::travel_to_snapshot(&table.file_io, &table.location, table.schema.options())
-                .await
+        if let Ok(Some(snapshot)) = time_travel::travel_to_snapshot(
+            &table.snapshot_manager(),
+            &table.tag_manager(),
+            table.schema.options(),
+        )
+        .await
         {
             if snapshot.schema_id() != table.schema.id() {
                 let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
@@ -300,6 +333,42 @@ impl Table {
             table.travel_snapshot = Some(snapshot);
         }
         Ok(table)
+    }
+
+    pub async fn copy_with_branch(&self, branch_name: &str) -> Result<Self> {
+        let branch = if branch_name.trim().is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "Branch name cannot be empty.".to_string(),
+                source: None,
+            });
+        } else {
+            branch_name.to_string()
+        };
+        let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
+            SchemaManager::new(self.file_io.clone(), self.location.clone())
+        } else {
+            SchemaManager::new(self.file_io.clone(), self.location.clone()).with_branch(&branch)
+        };
+        let schema = schema_manager
+            .latest()
+            .await?
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Branch '{branch}' does not exist."),
+                source: None,
+            })?;
+        let mut options = schema.options().clone();
+        options.insert("branch".to_string(), branch.clone());
+        Ok(Self {
+            file_io: self.file_io.clone(),
+            identifier: self.identifier.clone(),
+            location: self.location.clone(),
+            schema: schema.copy_with_replaced_options(options),
+            schema_manager,
+            branch,
+            rest_env: self.rest_env.clone(),
+            time_traveled: false,
+            travel_snapshot: None,
+        })
     }
 
     /// Whether this table copy reads a historical snapshot with its

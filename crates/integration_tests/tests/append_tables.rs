@@ -132,6 +132,7 @@ async fn write_commit_read(table: &Table, batches: Vec<RecordBatch>) -> Vec<Reco
         tw.write_arrow_batch(batch).await.unwrap();
     }
     wb.new_commit()
+        .unwrap()
         .commit(tw.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -205,6 +206,7 @@ async fn test_unpartitioned_two_commits() {
         .await
         .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -215,6 +217,7 @@ async fn test_unpartitioned_two_commits() {
         .await
         .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw2.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -247,6 +250,7 @@ async fn test_unpartitioned_projection() {
         .await
         .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -322,6 +326,7 @@ async fn test_fixed_bucket_scan_filters_by_bucket() {
     .await
     .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -417,6 +422,7 @@ async fn test_partitioned_two_commits() {
         .await
         .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw1.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -427,6 +433,7 @@ async fn test_partitioned_two_commits() {
         .await
         .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw2.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -465,6 +472,7 @@ async fn test_partitioned_scan_partition_filter() {
     .await
     .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw.prepare_commit().await.unwrap())
         .await
         .unwrap();
@@ -546,6 +554,7 @@ async fn test_partitioned_fixed_bucket_write_read() {
     .await
     .unwrap();
     wb.new_commit()
+        .unwrap()
         .commit(tw.prepare_commit().await.unwrap())
         .await
         .unwrap();

@@ -71,8 +71,12 @@ impl<'a> WriteBuilder<'a> {
     }
 
     /// Create a new TableCommit for committing write results.
-    pub fn new_commit(&self) -> TableCommit {
-        TableCommit::new(self.table.clone(), self.commit_user.clone())
+    pub fn new_commit(&self) -> crate::Result<TableCommit> {
+        self.ensure_main_branch_write()?;
+        Ok(TableCommit::new(
+            self.table.clone(),
+            self.commit_user.clone(),
+        ))
     }
 
     /// Create a new TableWrite for writing Arrow data.
@@ -80,6 +84,7 @@ impl<'a> WriteBuilder<'a> {
     /// For primary-key tables, sequence numbers are lazily scanned per partition
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
+        self.ensure_main_branch_write()?;
         // A table with a time-travel selector reads a pinned snapshot (and may
         // carry that snapshot's historical schema), so writing through the
         // same copy would be inconsistent with what its reads observe — even
@@ -108,12 +113,27 @@ impl<'a> WriteBuilder<'a> {
 
     /// Create a new TableUpdate for data-evolution row-id updates.
     pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+        self.ensure_main_branch_write()?;
         TableUpdate::new(self.table, update_columns)
     }
 
     /// Create a new writer for data-evolution row-id deletes.
     pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
+        self.ensure_main_branch_write()?;
         DataEvolutionDeleteWriter::new(self.table)
+    }
+
+    fn ensure_main_branch_write(&self) -> crate::Result<()> {
+        if self.table.is_main_branch() {
+            Ok(())
+        } else {
+            Err(crate::Error::Unsupported {
+                message: format!(
+                    "Writing to Paimon branch '{}' is not supported",
+                    self.table.branch()
+                ),
+            })
+        }
     }
 }
 
@@ -305,7 +325,7 @@ mod tests {
             messages[0].new_files[0].file_name
         );
 
-        wb.new_commit().commit(messages).await.unwrap();
+        wb.new_commit().unwrap().commit(messages).await.unwrap();
 
         let snapshot_manager =
             crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
@@ -339,7 +359,7 @@ mod tests {
             "Overwrite-aware writer must not produce input changelog files"
         );
 
-        wb.new_commit().commit(messages).await.unwrap();
+        wb.new_commit().unwrap().commit(messages).await.unwrap();
 
         let snapshot_manager =
             crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());

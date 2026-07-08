@@ -158,6 +158,7 @@ async fn execute_update_once(
         .map_err(to_datafusion_error)?;
     if !messages.is_empty() {
         wb.new_commit()
+            .map_err(to_datafusion_error)?
             .commit(messages)
             .await
             .map_err(to_datafusion_error)?;
@@ -220,7 +221,10 @@ async fn execute_cow_update_once(
 
     let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
     if !messages.is_empty() {
-        let commit = table.new_write_builder().new_commit();
+        let commit = table
+            .new_write_builder()
+            .new_commit()
+            .map_err(to_datafusion_error)?;
         commit.commit(messages).await.map_err(to_datafusion_error)?;
     }
 

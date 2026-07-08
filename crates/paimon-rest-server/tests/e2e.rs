@@ -242,7 +242,12 @@ async fn test_write_commit_read_roundtrip() {
     writer.write_arrow_batch(&sample_batch()).await.unwrap();
     let messages = writer.prepare_commit().await.unwrap();
     assert!(!messages.is_empty(), "expected at least one commit message");
-    write_builder.new_commit().commit(messages).await.unwrap();
+    write_builder
+        .new_commit()
+        .unwrap()
+        .commit(messages)
+        .await
+        .unwrap();
 
     // Read back.
     let table = cat.get_table(&ident).await.unwrap();
@@ -352,7 +357,12 @@ async fn test_list_partitions() {
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
     assert!(!messages.is_empty(), "expected at least one commit message");
-    write_builder.new_commit().commit(messages).await.unwrap();
+    write_builder
+        .new_commit()
+        .unwrap()
+        .commit(messages)
+        .await
+        .unwrap();
 
     // The partitions endpoint must serve the two partitions (no 404 fallback);
     // the client receives them directly from the server.
