@@ -114,7 +114,7 @@ async fn execute_data_evolution_delete_once(
 
     let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
     if !messages.is_empty() {
-        wb.new_commit()
+        wb.try_new_commit()
             .map_err(to_datafusion_error)?
             .commit(messages)
             .await
@@ -168,7 +168,7 @@ async fn execute_cow_delete_once(
     if !messages.is_empty() {
         let commit = table
             .new_write_builder()
-            .new_commit()
+            .try_new_commit()
             .map_err(to_datafusion_error)?;
         commit.commit(messages).await.map_err(to_datafusion_error)?;
     }

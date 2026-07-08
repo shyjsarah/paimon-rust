@@ -1272,7 +1272,7 @@ impl SQLContext {
         }
 
         let messages = tw.prepare_commit().await.map_err(to_datafusion_error)?;
-        let commit = wb.new_commit().map_err(to_datafusion_error)?;
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
 
         let overwrite_partitions = if static_partitions.is_empty() {
             None
@@ -1308,7 +1308,7 @@ impl SQLContext {
         };
 
         let wb = table.new_write_builder();
-        let commit = wb.new_commit().map_err(to_datafusion_error)?;
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
 
         if let Some(partitions) = &truncate.partitions {
             if partitions.is_empty() {
@@ -1393,7 +1393,7 @@ impl SQLContext {
         )?;
 
         let wb = table.new_write_builder();
-        let commit = wb.new_commit().map_err(to_datafusion_error)?;
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
         commit
             .truncate_partitions(partition_values)
             .await

@@ -208,12 +208,18 @@ async fn test_select_branch_table_reads_branch_snapshot() {
     assert!(write_builder.new_write().is_err());
     assert!(write_builder.new_update(vec!["name".to_string()]).is_err());
     assert!(write_builder.new_delete().is_err());
-    assert!(write_builder.new_commit().is_err());
+    assert!(write_builder.try_new_commit().is_err());
 
     assert_sql_error_contains(
         &sql_context,
         "INSERT INTO paimon.default.branch_orders$branch_b1 VALUES (3, 'blocked')",
         "Writing to Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "INSERT INTO paimon.default.branch_orders$branch_main VALUES (3, 'blocked')",
+        "Writing to Paimon branch 'main' is not supported",
     )
     .await;
     assert_sql_error_contains(

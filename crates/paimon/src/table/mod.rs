@@ -106,7 +106,7 @@ pub use vector_search_builder::{BatchVectorSearchBuilder, VectorSearchBuilder};
 pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
-use crate::catalog::{Identifier, DEFAULT_MAIN_BRANCH};
+use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
@@ -120,6 +120,7 @@ pub struct Table {
     schema: TableSchema,
     schema_manager: SchemaManager,
     branch: String,
+    branch_reference: bool,
     rest_env: Option<RESTEnv>,
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
@@ -148,6 +149,7 @@ impl Table {
             schema,
             schema_manager,
             branch,
+            branch_reference: false,
             rest_env,
             time_traveled: false,
             travel_snapshot: None,
@@ -185,6 +187,10 @@ impl Table {
 
     pub fn is_main_branch(&self) -> bool {
         self.branch == DEFAULT_MAIN_BRANCH
+    }
+
+    pub fn is_branch_reference(&self) -> bool {
+        self.branch_reference
     }
 
     pub fn snapshot_manager(&self) -> SnapshotManager {
@@ -287,6 +293,7 @@ impl Table {
             schema: self.schema.copy_with_options(extra),
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
+            branch_reference: self.branch_reference,
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
             travel_snapshot: if selector_changed {
@@ -342,6 +349,7 @@ impl Table {
                 source: None,
             });
         } else {
+            validate_branch_name(branch_name)?;
             branch_name.to_string()
         };
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
@@ -365,6 +373,7 @@ impl Table {
             schema: schema.copy_with_replaced_options(options),
             schema_manager,
             branch,
+            branch_reference: true,
             rest_env: self.rest_env.clone(),
             time_traveled: false,
             travel_snapshot: None,
@@ -387,7 +396,7 @@ impl Table {
 
     /// The snapshot resolved by [`Table::copy_with_time_travel`] from this
     /// copy's options, if any. Lets scans skip re-resolving the selector.
-    pub(crate) fn travel_snapshot(&self) -> Option<&Snapshot> {
+    pub fn travel_snapshot(&self) -> Option<&Snapshot> {
         self.travel_snapshot.as_ref()
     }
 }

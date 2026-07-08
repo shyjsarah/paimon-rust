@@ -71,7 +71,13 @@ impl<'a> WriteBuilder<'a> {
     }
 
     /// Create a new TableCommit for committing write results.
-    pub fn new_commit(&self) -> crate::Result<TableCommit> {
+    pub fn new_commit(&self) -> TableCommit {
+        self.try_new_commit()
+            .expect("Cannot create TableCommit for a branch table")
+    }
+
+    /// Try to create a new TableCommit for committing write results.
+    pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
         self.ensure_main_branch_write()?;
         Ok(TableCommit::new(
             self.table.clone(),
@@ -124,7 +130,7 @@ impl<'a> WriteBuilder<'a> {
     }
 
     fn ensure_main_branch_write(&self) -> crate::Result<()> {
-        if self.table.is_main_branch() {
+        if !self.table.is_branch_reference() {
             Ok(())
         } else {
             Err(crate::Error::Unsupported {
@@ -325,7 +331,7 @@ mod tests {
             messages[0].new_files[0].file_name
         );
 
-        wb.new_commit().unwrap().commit(messages).await.unwrap();
+        wb.new_commit().commit(messages).await.unwrap();
 
         let snapshot_manager =
             crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
@@ -359,7 +365,7 @@ mod tests {
             "Overwrite-aware writer must not produce input changelog files"
         );
 
-        wb.new_commit().unwrap().commit(messages).await.unwrap();
+        wb.new_commit().commit(messages).await.unwrap();
 
         let snapshot_manager =
             crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());

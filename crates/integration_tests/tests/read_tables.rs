@@ -150,7 +150,6 @@ async fn ensure_data_evolution_table<C: Catalog + ?Sized>(catalog: &C) {
         .add_matched_batch(data_evolution_update_batch())
         .expect("Failed to add data-evolution update batch");
     wb.new_commit()
-        .unwrap()
         .commit(
             update
                 .prepare_commit()
@@ -221,7 +220,6 @@ async fn append_data_evolution_batch(table: &paimon::Table, batch: RecordBatch) 
         .await
         .expect("Failed to write fixture batch");
     wb.new_commit()
-        .unwrap()
         .commit(
             write
                 .prepare_commit()

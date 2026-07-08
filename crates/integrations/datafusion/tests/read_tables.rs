@@ -1803,7 +1803,6 @@ mod vector_search_tests {
             .expect("Failed to prepare commit");
         write_builder
             .new_commit()
-            .unwrap()
             .commit(messages)
             .await
             .expect("Failed to commit vector data");
@@ -1887,7 +1886,6 @@ mod vector_search_tests {
             .expect("Failed to prepare commit");
         write_builder
             .new_commit()
-            .unwrap()
             .commit(messages)
             .await
             .expect("Failed to commit vector data");

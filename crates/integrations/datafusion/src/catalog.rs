@@ -442,11 +442,17 @@ impl SchemaProvider for PaimonSchemaProvider {
         let catalog = Arc::clone(&self.catalog);
         let identifier = Identifier::new(self.database.clone(), object.table().to_string());
         let branch = object.branch().map(str::to_string);
+        let is_branches_table = object
+            .system_table()
+            .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
         block_on_with_runtime(
             async move {
                 match catalog.get_table(&identifier).await {
                     Ok(table) => {
                         if let Some(branch) = branch.as_deref() {
+                            if is_branches_table {
+                                return true;
+                            }
                             table.copy_with_branch(branch).await.is_ok()
                         } else {
                             true

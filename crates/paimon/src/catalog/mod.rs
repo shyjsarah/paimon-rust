@@ -181,7 +181,7 @@ pub fn parse_object_name(object: &str) -> Result<ParsedObjectName> {
                 message: format!("Branch name cannot be empty in object name: {object}"),
             });
         }
-        validate_identifier_name("branch", branch)?;
+        validate_branch_name(branch)?;
         Ok(branch.to_string())
     };
 
@@ -210,6 +210,10 @@ pub fn parse_object_name(object: &str) -> Result<ParsedObjectName> {
         }
         _ => Err(invalid()),
     }
+}
+
+pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
+    validate_identifier_name("branch", name)
 }
 
 fn validate_identifier_name(kind: &str, name: &str) -> Result<()> {

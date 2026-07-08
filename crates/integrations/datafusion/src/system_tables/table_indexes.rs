@@ -188,9 +188,12 @@ impl TableProvider for TableIndexesTable {
 async fn collect_index_entries(table: &Table) -> paimon::Result<Vec<IndexManifestEntry>> {
     let file_io = table.file_io();
     let sm = table.snapshot_manager();
-    let snapshot = match sm.get_latest_snapshot().await? {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let snapshot = match table.travel_snapshot().cloned() {
+        Some(snapshot) => snapshot,
+        None => match sm.get_latest_snapshot().await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        },
     };
     let Some(index_manifest_name) = snapshot.index_manifest() else {
         return Ok(Vec::new());
