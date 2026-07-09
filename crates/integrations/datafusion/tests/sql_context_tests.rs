@@ -220,6 +220,13 @@ async fn test_select_branch_table_reads_branch_snapshot() {
         .await,
         vec![1]
     );
+    assert!(!collect_string_column(
+        &sql_context,
+        "SELECT file_name FROM paimon.default.branch_orders$branch_b1$manifests",
+        "file_name",
+    )
+    .await
+    .is_empty());
 
     let branch_table = table.copy_with_branch("b1").await.unwrap();
     let write_builder = branch_table.new_write_builder();
@@ -358,6 +365,26 @@ async fn test_branch_partitions_system_table_reads_branch_snapshot() {
         collect_string_column(
             &sql_context,
             "SELECT \"partition\" FROM paimon.default.branch_partition_orders$branch_b1$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$partitions \
+             VERSION AS OF 'partition_branch_base'",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$branch_b1$partitions \
+             VERSION AS OF 'partition_branch_base'",
             "partition",
         )
         .await,

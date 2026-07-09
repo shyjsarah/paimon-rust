@@ -118,21 +118,22 @@ impl TableProvider for PartitionsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let partitions = if self.table.is_branch_reference() {
-            let table = self.table.clone();
-            crate::runtime::await_with_runtime(async move {
-                list_partitions_from_file_system(&table).await
-            })
-            .await
-        } else {
-            let catalog = self.catalog.clone();
-            let identifier = self.identifier.clone();
-            crate::runtime::await_with_runtime(
-                async move { catalog.list_partitions(&identifier).await },
-            )
-            .await
-        }
-        .map_err(to_datafusion_error)?;
+        let partitions =
+            if self.table.is_branch_reference() || self.table.travel_snapshot().is_some() {
+                let table = self.table.clone();
+                crate::runtime::await_with_runtime(async move {
+                    list_partitions_from_file_system(&table).await
+                })
+                .await
+            } else {
+                let catalog = self.catalog.clone();
+                let identifier = self.identifier.clone();
+                crate::runtime::await_with_runtime(async move {
+                    catalog.list_partitions(&identifier).await
+                })
+                .await
+            }
+            .map_err(to_datafusion_error)?;
 
         let mut rows: Vec<(String, Partition)> = partitions
             .into_iter()

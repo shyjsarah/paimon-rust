@@ -35,9 +35,12 @@ pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Parti
     let file_io = table.file_io();
     let snapshot_sm = table.snapshot_manager();
     let manifest_sm = SnapshotManager::new(file_io.clone(), table.location().to_string());
-    let snapshot = match snapshot_sm.get_latest_snapshot().await? {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
+    let snapshot = match table.travel_snapshot().cloned() {
+        Some(snapshot) => snapshot,
+        None => match snapshot_sm.get_latest_snapshot().await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        },
     };
 
     let base_path = manifest_sm.manifest_path(snapshot.base_manifest_list());
