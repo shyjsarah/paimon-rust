@@ -31,17 +31,7 @@ datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
-To query tables with Mosaic data files, enable the `mosaic` feature on both crates:
-
-```toml
-[dependencies]
-paimon = { version = "0.3.0", features = ["mosaic"] }
-paimon-datafusion = { version = "0.3.0", features = ["mosaic"] }
-datafusion = "54.0.0"
-tokio = { version = "1", features = ["full"] }
-```
-
-Mosaic support is currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
+Mosaic support is always available and currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
 
 ## SQL Support Scope
 
@@ -100,7 +90,7 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `FLOAT` / `REAL` | FloatType | |
 | `DOUBLE` / `DOUBLE PRECISION` | DoubleType | |
 | `VARCHAR` / `TEXT` / `STRING` / `CHAR` | VarCharType | |
-| `BINARY` / `VARBINARY` / `BYTEA` | VarBinaryType | |
+| `BINARY` / `VARBINARY` / `BYTEA` / `BYTES` | VarBinaryType | |
 | `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
 | `DATE` | DateType | |
@@ -116,6 +106,48 @@ columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
 columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
 index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
 does not round-trip `VECTOR` columns.
+
+### Blob Columns
+
+BLOB columns store large binary values using Paimon's dedicated BLOB layout.
+Declare them as top-level columns and enable data evolution:
+
+```sql
+CREATE TABLE paimon.my_db.assets (
+    id INT,
+    picture BLOB
+) WITH (
+    'data-evolution.enabled' = 'true'
+);
+```
+
+For Java-compatible DDL, DataFusion also supports the BLOB comment directives
+used by Java Paimon. A binary column with one of these directive comments is
+normalized to a Paimon BLOB column in the core schema layer:
+
+```sql
+CREATE TABLE paimon.my_db.assets (
+    id INT,
+    picture BYTES COMMENT '__BLOB_FIELD; original image',
+    thumbnail BYTES COMMENT '__BLOB_DESCRIPTOR_FIELD; descriptor bytes',
+    picture_ref BYTES COMMENT '__BLOB_VIEW_FIELD; upstream image reference'
+) WITH (
+    'data-evolution.enabled' = 'true'
+);
+```
+
+The directive is stripped from the stored column comment; text after the first
+semicolon is kept as the real comment. The directives also populate the matching
+table options. A comment directive that starts with `__BLOB` but is not one of
+the supported directives is rejected.
+
+| Comment directive | Table option | Storage semantics |
+| --- | --- | --- |
+| `__BLOB_FIELD` | `blob-field` | Store BLOB bytes in dedicated `.blob` files |
+| `__BLOB_DESCRIPTOR_FIELD` | `blob-descriptor-field` | Store serialized `BlobDescriptor` bytes inline |
+| `__BLOB_VIEW_FIELD` | `blob-view-field` | Store serialized `BlobViewStruct` bytes inline |
+
+The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
 
 ### Blob View
 
@@ -534,7 +566,7 @@ For primary-key tables, records with duplicate keys are deduplicated according t
 
 ### Mosaic Read Scope
 
-The Mosaic reader uses row-group statistics for conservative pruning when they are present. This pruning is not row-level filter enforcement; DataFusion still applies SQL filters above the reader to produce exact query results.
+The Mosaic reader supports scalar, temporal, array, and map columns. It uses row-group statistics for conservative pruning when they are present. This pruning is not row-level filter enforcement; DataFusion still applies SQL filters above the reader to produce exact query results.
 
 Unsupported or limited Mosaic areas include writing `.mosaic` files, emitting manifest `value_stats` for Mosaic writes, Mosaic bloom filters, and Mosaic-specific performance tuning.
 
