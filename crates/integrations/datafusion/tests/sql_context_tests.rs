@@ -230,8 +230,48 @@ async fn test_select_branch_table_reads_branch_snapshot() {
     .await;
     assert_sql_error_contains(
         &sql_context,
+        "UPDATE paimon.default.branch_orders$branch_main SET name = 'blocked' WHERE id = 1",
+        "UPDATE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
         "DELETE FROM paimon.default.branch_orders$branch_b1 WHERE id = 1",
         "DELETE on Paimon branch 'b1' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "DELETE FROM paimon.default.branch_orders$branch_main WHERE id = 1",
+        "DELETE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "MERGE INTO paimon.default.branch_orders$branch_main AS target \
+         USING (SELECT 1 AS id, 'blocked' AS name) AS source \
+         ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET name = source.name",
+        "MERGE INTO on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "TRUNCATE TABLE paimon.default.branch_orders$branch_main",
+        "TRUNCATE TABLE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "ALTER TABLE paimon.default.branch_orders$branch_main ADD COLUMN blocked INT",
+        "ALTER TABLE on Paimon branch 'main' is not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "INSERT OVERWRITE paimon.default.branch_orders$branch_main \
+         PARTITION (id = 1) SELECT 'blocked'",
+        "INSERT OVERWRITE on Paimon branch 'main' is not supported",
     )
     .await;
 }

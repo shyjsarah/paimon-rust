@@ -57,7 +57,7 @@ use datafusion::sql::sqlparser::ast::{
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use futures::StreamExt;
-use paimon::catalog::{parse_object_name, Catalog, Identifier, DEFAULT_MAIN_BRANCH};
+use paimon::catalog::{parse_object_name, Catalog, Identifier};
 use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BinaryType, BlobType, BooleanType, CharType,
     DataField as PaimonDataField, DataType as PaimonDataType, DateType, Datum, DecimalType,
@@ -1492,11 +1492,9 @@ impl SQLContext {
             .ok_or_else(|| DataFusionError::Plan(format!("Invalid table reference: {name}")))?;
         let parsed = parse_object_name(object).map_err(to_datafusion_error)?;
         if let Some(branch) = parsed.branch() {
-            if branch != DEFAULT_MAIN_BRANCH {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "{operation} on Paimon branch '{branch}' is not supported"
-                )));
-            }
+            return Err(DataFusionError::NotImplemented(format!(
+                "{operation} on Paimon branch '{branch}' is not supported"
+            )));
         }
         Ok(())
     }
