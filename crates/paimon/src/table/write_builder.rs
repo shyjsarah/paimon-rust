@@ -130,16 +130,7 @@ impl<'a> WriteBuilder<'a> {
     }
 
     fn ensure_main_branch_write(&self) -> crate::Result<()> {
-        if !self.table.is_branch_reference() {
-            Ok(())
-        } else {
-            Err(crate::Error::Unsupported {
-                message: format!(
-                    "Writing to Paimon branch '{}' is not supported",
-                    self.table.branch()
-                ),
-            })
-        }
+        self.table.ensure_not_branch_reference_for_write()
     }
 }
 
@@ -218,6 +209,13 @@ mod tests {
             TableSchema::new(0, &schema),
             None,
         )
+    }
+
+    fn as_main_branch_reference(table: Table) -> Table {
+        Table {
+            branch_reference: true,
+            ..table
+        }
     }
 
     fn input_changelog_pk_table(file_io: &FileIO, table_path: &str) -> Table {
@@ -341,6 +339,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.commit_user(), "my-commit-user");
+    }
+
+    #[tokio::test]
+    async fn test_branch_reference_rejects_write_and_index_builders() {
+        let table = as_main_branch_reference(test_postpone_pk_table(
+            &test_file_io(),
+            "memory:/test_branch_reference_writes",
+        ));
+
+        let write_err = table.new_write_builder().try_new_commit().err().unwrap();
+        assert!(
+            matches!(write_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch write rejection, got: {write_err:?}"
+        );
+
+        let index_err = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("value")
+            .execute()
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(index_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch index-build rejection, got: {index_err:?}"
+        );
     }
 
     #[tokio::test]

@@ -194,6 +194,19 @@ impl Table {
         self.branch_reference
     }
 
+    pub(crate) fn ensure_not_branch_reference_for_write(&self) -> Result<()> {
+        if self.is_branch_reference() {
+            Err(crate::Error::Unsupported {
+                message: format!(
+                    "Writing to Paimon branch '{}' is not supported",
+                    self.branch()
+                ),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn snapshot_manager(&self) -> SnapshotManager {
         let manager = SnapshotManager::new(self.file_io.clone(), self.location.clone());
         if self.is_main_branch() {
