@@ -493,6 +493,30 @@ async fn test_create_table() {
 }
 
 #[tokio::test]
+async fn test_create_table_rejects_reserved_branch_and_system_suffixes() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    assert_sql_error_contains(
+        &sql_context,
+        "CREATE TABLE paimon.mydb.t$branch_b1 (id INT)",
+        "suffixes are reserved for branch and system-table reads",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "CREATE TABLE paimon.mydb.t$snapshots (id INT)",
+        "suffixes are reserved for branch and system-table reads",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_create_table_with_blob_type() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;

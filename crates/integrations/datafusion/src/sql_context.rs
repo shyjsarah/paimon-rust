@@ -723,6 +723,15 @@ impl SQLContext {
         }
 
         let identifier = self.resolve_table_name(&ct.name)?;
+        let parsed = identifier
+            .parsed_object_name()
+            .map_err(to_datafusion_error)?;
+        if parsed.branch().is_some() || parsed.system_table().is_some() {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot create Paimon table '{}': '$branch_' and '$<system_table>' suffixes are reserved for branch and system-table reads",
+                identifier.object()
+            )));
+        }
 
         let mut builder = paimon::spec::Schema::builder();
         let table_options = extract_options(&ct.table_options)?;
