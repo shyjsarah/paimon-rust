@@ -80,6 +80,24 @@ async fn collect_i64_column(sql_context: &SQLContext, sql: &str, column: &str) -
     values
 }
 
+async fn collect_string_column(sql_context: &SQLContext, sql: &str, column: &str) -> Vec<String> {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(column)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect(column);
+        for row in 0..batch.num_rows() {
+            if !array.is_null(row) {
+                values.push(array.value(row).to_string());
+            }
+        }
+    }
+    values.sort_unstable();
+    values
+}
+
 async fn assert_sql_error_contains(sql_context: &SQLContext, sql: &str, expected: &str) {
     let err = match sql_context.sql(sql).await {
         Ok(df) => df
@@ -274,6 +292,77 @@ async fn test_select_branch_table_reads_branch_snapshot() {
         "INSERT OVERWRITE on Paimon branch 'main' is not supported",
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_branch_partitions_system_table_reads_branch_snapshot() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.default.branch_partition_orders \
+             (id INT, name STRING) PARTITIONED BY (id)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_partition_orders VALUES (1, 'branch')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let identifier = Identifier::new("default", "branch_partition_orders");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let tag_manager = TagManager::new(table.file_io().clone(), table.location().to_string());
+    tag_manager
+        .create("partition_branch_base", &snapshot)
+        .await
+        .unwrap();
+    let branch_manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    branch_manager
+        .create_branch_from_tag("b1", "partition_branch_base")
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.default.branch_partition_orders VALUES (2, 'main')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string(), "id=2".to_string()]
+    );
+    assert_eq!(
+        collect_string_column(
+            &sql_context,
+            "SELECT \"partition\" FROM paimon.default.branch_partition_orders$branch_b1$partitions",
+            "partition",
+        )
+        .await,
+        vec!["id=1".to_string()]
+    );
 }
 
 // ======================= CREATE / DROP SCHEMA =======================
