@@ -200,6 +200,9 @@ impl<'a> TableRead<'a> {
             self.data_predicates.clone(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
+            core_options.blob_view_fields(),
+            core_options.blob_view_resolve_enabled(),
+            self.table.rest_env().cloned(),
         )?;
         reader.read(data_splits)
     }

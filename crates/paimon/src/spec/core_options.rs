@@ -47,6 +47,8 @@ const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const FILE_FORMAT_OPTION: &str = "file.format";
+const VECTOR_FILE_FORMAT_OPTION: &str = "vector.file.format";
+const VECTOR_TARGET_FILE_SIZE_OPTION: &str = "vector.target-file-size";
 const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
 const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
@@ -92,6 +94,8 @@ const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
+const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
+pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 
 /// Merge engine for primary-key tables.
 ///
@@ -710,6 +714,24 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_else(|| self.target_file_size())
     }
 
+    /// Dedicated vector-store file format, if configured.
+    ///
+    /// Java leaves this unset by default. When present, vector columns are
+    /// written to files named `*.vector.<format>`.
+    pub fn vector_file_format(&self) -> Option<&str> {
+        self.options
+            .get(VECTOR_FILE_FORMAT_OPTION)
+            .map(String::as_str)
+            .filter(|format| !format.trim().is_empty())
+    }
+
+    pub fn vector_target_file_size(&self) -> i64 {
+        self.options
+            .get(VECTOR_TARGET_FILE_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .unwrap_or_else(|| self.target_file_size())
+    }
+
     /// File format for data files (e.g. "parquet", "orc", "avro", "vortex").
     /// Default is "parquet".
     pub fn file_format(&self) -> &str {
@@ -814,9 +836,43 @@ impl<'a> CoreOptions<'a> {
     /// Comma-separated BLOB field names stored as serialized BlobDescriptor
     /// bytes inline in normal data files (no .blob files for these fields).
     pub fn blob_descriptor_fields(&self) -> HashSet<String> {
+        self.parse_csv_set(BLOB_DESCRIPTOR_FIELD_OPTION)
+    }
+
+    /// Comma-separated BLOB field names stored as serialized BlobViewStruct
+    /// bytes inline in normal data files.
+    pub fn blob_view_fields(&self) -> HashSet<String> {
+        self.parse_csv_set(BLOB_VIEW_FIELD_OPTION)
+    }
+
+    /// Whether blob-view fields should resolve upstream BLOB values on reads.
+    /// Default is true, matching Java `CoreOptions.BLOB_VIEW_RESOLVE_ENABLED`.
+    pub fn blob_view_resolve_enabled(&self) -> bool {
         self.options
-            .get(BLOB_DESCRIPTOR_FIELD_OPTION)
-            .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
+            .get(BLOB_VIEW_RESOLVE_ENABLED_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
+    /// BLOB fields stored inline in normal data files: descriptor fields plus
+    /// view fields. Non-inline BLOB fields are written to dedicated `.blob`
+    /// files.
+    pub fn blob_inline_fields(&self) -> HashSet<String> {
+        let mut fields = self.blob_descriptor_fields();
+        fields.extend(self.blob_view_fields());
+        fields
+    }
+
+    fn parse_csv_set(&self, option_name: &'static str) -> HashSet<String> {
+        self.options
+            .get(option_name)
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -1225,6 +1281,26 @@ mod tests {
     }
 
     #[test]
+    fn test_vector_file_options_defaults_and_overrides() {
+        let default_options =
+            HashMap::from([("target-file-size".to_string(), "32 mb".to_string())]);
+        let default_core = CoreOptions::new(&default_options);
+        assert_eq!(default_core.vector_file_format(), None);
+        assert_eq!(default_core.vector_target_file_size(), 32 * 1024 * 1024);
+
+        let custom_options = HashMap::from([
+            (VECTOR_FILE_FORMAT_OPTION.to_string(), "vortex".to_string()),
+            (
+                VECTOR_TARGET_FILE_SIZE_OPTION.to_string(),
+                "64 mb".to_string(),
+            ),
+        ]);
+        let custom_core = CoreOptions::new(&custom_options);
+        assert_eq!(custom_core.vector_file_format(), Some("vortex"));
+        assert_eq!(custom_core.vector_target_file_size(), 64 * 1024 * 1024);
+    }
+
+    #[test]
     fn test_commit_options_defaults() {
         let options = HashMap::new();
         let core = CoreOptions::new(&options);
@@ -1367,6 +1443,46 @@ mod tests {
         )]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.write_parquet_buffer_size(), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_blob_view_options() {
+        let options = HashMap::from([
+            (
+                BLOB_DESCRIPTOR_FIELD_OPTION.to_string(),
+                "thumb, payload".to_string(),
+            ),
+            (
+                BLOB_VIEW_FIELD_OPTION.to_string(),
+                "image, video".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(
+            core.blob_descriptor_fields(),
+            HashSet::from(["thumb".to_string(), "payload".to_string()])
+        );
+        assert_eq!(
+            core.blob_view_fields(),
+            HashSet::from(["image".to_string(), "video".to_string()])
+        );
+        assert_eq!(
+            core.blob_inline_fields(),
+            HashSet::from([
+                "thumb".to_string(),
+                "payload".to_string(),
+                "image".to_string(),
+                "video".to_string()
+            ])
+        );
+        assert!(core.blob_view_resolve_enabled());
+
+        let disabled = HashMap::from([(
+            BLOB_VIEW_RESOLVE_ENABLED_OPTION.to_string(),
+            "false".to_string(),
+        )]);
+        assert!(!CoreOptions::new(&disabled).blob_view_resolve_enabled());
     }
 
     #[test]

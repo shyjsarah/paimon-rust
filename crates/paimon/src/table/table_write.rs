@@ -26,7 +26,6 @@ use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
     DataType, MergeEngine, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
 };
-use crate::table::blob_file_writer::AppendBlobFileWriter;
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
@@ -35,6 +34,7 @@ use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
 use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
+use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
@@ -48,7 +48,7 @@ use std::sync::Arc;
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
     Append(DataFileWriter),
-    AppendBlob(AppendBlobFileWriter),
+    AppendDedicated(Box<AppendDedicatedFormatFileWriter>),
     KeyValue(KeyValueFileWriter),
     Postpone(PostponeFileWriter),
 }
@@ -57,7 +57,7 @@ impl FileWriter {
     async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         match self {
             FileWriter::Append(w) => w.write(batch).await,
-            FileWriter::AppendBlob(w) => w.write(batch).await,
+            FileWriter::AppendDedicated(w) => w.write(batch).await,
             FileWriter::KeyValue(w) => w.write(batch).await,
             FileWriter::Postpone(w) => w.write(batch).await,
         }
@@ -66,7 +66,9 @@ impl FileWriter {
     async fn prepare_commit(mut self) -> Result<PreparedFiles> {
         match self {
             FileWriter::Append(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
-            FileWriter::AppendBlob(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::AppendDedicated(ref mut w) => {
+                w.prepare_commit().await.map(PreparedFiles::data)
+            }
             FileWriter::KeyValue(ref mut w) => w.prepare_commit().await,
             FileWriter::Postpone(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
         }
@@ -90,6 +92,7 @@ pub struct TableWrite {
     schema_id: i64,
     target_file_size: i64,
     blob_target_file_size: i64,
+    vector_target_file_size: i64,
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
@@ -108,10 +111,16 @@ pub struct TableWrite {
     bucket_assigner: BucketAssignerEnum,
     /// Whether this is an overwrite operation (skip seq/index restore).
     is_overwrite: bool,
-    /// Blob descriptor fields (stored inline in parquet, not as separate .blob files).
-    blob_descriptor_fields: HashSet<String>,
-    /// Whether the table has non-descriptor blob fields requiring AppendBlobFileWriter.
+    /// Blob view fields (stored inline as BlobViewStruct bytes).
+    blob_view_fields: HashSet<String>,
+    /// Descriptor + view inline blob fields.
+    blob_inline_fields: HashSet<String>,
+    /// Whether the table has non-descriptor blob fields requiring a dedicated-format writer.
     has_blob_fields: bool,
+    /// Dedicated vector-store file format, when configured.
+    vector_file_format: Option<String>,
+    /// Whether the table has VECTOR fields requiring dedicated vector files.
+    has_dedicated_vector_fields: bool,
 }
 
 impl TableWrite {
@@ -120,25 +129,39 @@ impl TableWrite {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
+        let blob_view_fields = core_options.blob_view_fields();
+        let blob_inline_fields = core_options.blob_inline_fields();
 
-        for name in &blob_descriptor_fields {
+        for name in &blob_inline_fields {
             match schema.fields().iter().find(|f| f.name() == name) {
                 None => {
                     return Err(crate::Error::DataInvalid {
-                        message: format!("blob-descriptor-field '{name}' does not exist in schema"),
+                        message: format!("inline blob field '{name}' does not exist in schema"),
                         source: None,
                     });
                 }
                 Some(f) if !f.data_type().is_blob_type() => {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
-                            "blob-descriptor-field '{name}' is not a top-level BLOB field"
+                            "inline blob field '{name}' is not a top-level BLOB field"
                         ),
                         source: None,
                     });
                 }
                 _ => {}
             }
+        }
+        if let Some(name) = blob_descriptor_fields
+            .intersection(&blob_view_fields)
+            .next()
+            .cloned()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Field '{name}' in 'blob-view-field' can not also be in 'blob-descriptor-field'"
+                ),
+                source: None,
+            });
         }
 
         let total_buckets = core_options.bucket();
@@ -175,9 +198,11 @@ impl TableWrite {
         }
         let target_file_size = core_options.target_file_size();
         let blob_target_file_size = core_options.blob_target_file_size();
+        let vector_target_file_size = core_options.vector_target_file_size();
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let file_format = core_options.file_format().to_string();
+        let vector_file_format = core_options.vector_file_format().map(str::to_string);
         let changelog_file_prefix = core_options.changelog_file_prefix().to_string();
         let changelog_file_format = core_options.changelog_file_format().to_string();
         let changelog_file_compression = core_options.changelog_file_compression().to_string();
@@ -304,7 +329,12 @@ impl TableWrite {
         let has_blob_fields = schema
             .fields()
             .iter()
-            .any(|f| f.data_type().is_blob_type() && !blob_descriptor_fields.contains(f.name()));
+            .any(|f| f.data_type().is_blob_type() && !blob_inline_fields.contains(f.name()));
+        let has_dedicated_vector_fields = vector_file_format.is_some()
+            && schema
+                .fields()
+                .iter()
+                .any(|f| matches!(f.data_type(), DataType::Vector(_)));
 
         Ok(Self {
             table: table.clone(),
@@ -314,6 +344,7 @@ impl TableWrite {
             schema_id: schema.id(),
             target_file_size,
             blob_target_file_size,
+            vector_target_file_size,
             file_compression,
             file_compression_zstd_level,
             write_buffer_size,
@@ -330,8 +361,11 @@ impl TableWrite {
             commit_user,
             bucket_assigner,
             is_overwrite,
-            blob_descriptor_fields,
+            blob_view_fields,
+            blob_inline_fields,
             has_blob_fields,
+            vector_file_format,
+            has_dedicated_vector_fields,
         })
     }
 
@@ -624,25 +658,33 @@ impl TableWrite {
 
     /// Create an append-only writer for non-PK tables.
     fn create_append_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
-        if self.has_blob_fields {
+        if self.has_blob_fields
+            || self.has_dedicated_vector_fields
+            || !self.blob_view_fields.is_empty()
+        {
             let fields = self.table.schema().fields();
             let input_schema = build_target_arrow_schema(fields)?;
-            Ok(FileWriter::AppendBlob(AppendBlobFileWriter::new(
-                self.table.file_io().clone(),
-                self.table.location().to_string(),
-                partition_path,
-                bucket,
-                self.schema_id,
-                self.target_file_size,
-                self.blob_target_file_size,
-                self.file_compression.clone(),
-                self.file_compression_zstd_level,
-                self.write_buffer_size,
-                self.file_format.clone(),
-                &input_schema,
-                fields,
-                self.table.schema().options(),
-                &self.blob_descriptor_fields,
+            Ok(FileWriter::AppendDedicated(Box::new(
+                AppendDedicatedFormatFileWriter::new(
+                    self.table.file_io().clone(),
+                    self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    self.schema_id,
+                    self.target_file_size,
+                    self.blob_target_file_size,
+                    self.file_compression.clone(),
+                    self.file_compression_zstd_level,
+                    self.write_buffer_size,
+                    self.file_format.clone(),
+                    self.vector_target_file_size,
+                    self.vector_file_format.as_deref(),
+                    &input_schema,
+                    fields,
+                    self.table.schema().options(),
+                    &self.blob_inline_fields,
+                    &self.blob_view_fields,
+                ),
             )))
         } else {
             Ok(FileWriter::Append(DataFileWriter::new(
@@ -745,9 +787,10 @@ mod tests {
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{
         bucket_dir_name, BigIntType, BinaryRowBuilder, BlobType, DataField, DataType, DecimalType,
-        FileKind, IndexManifest, IntType, LocalZonedTimestampType, Manifest, ManifestList, Schema,
-        TableSchema, TimestampType, TinyIntType, VarCharType, SEQUENCE_NUMBER_FIELD_ID,
-        SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
+        FileKind, FloatType, IndexManifest, IntType, LocalZonedTimestampType, Manifest,
+        ManifestList, Schema, TableSchema, TimestampType, TinyIntType, VarCharType, VectorType,
+        SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+        VALUE_KIND_FIELD_NAME,
     };
     use crate::table::{SnapshotManager, TableCommit};
     use arrow_array::RecordBatchReader as _;
@@ -810,6 +853,21 @@ mod tests {
         TableSchema::new(0, &schema)
     }
 
+    fn test_vector_table_schema(vector_file_format: &str) -> TableSchema {
+        let vector_type = DataType::Vector(
+            VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("embedding", vector_type)
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("vector.file.format", vector_file_format)
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
     async fn setup_dirs(file_io: &FileIO, table_path: &str) {
         file_io
             .mkdirs(&format!("{table_path}/snapshot/"))
@@ -832,6 +890,36 @@ mod tests {
                 Arc::new(Int32Array::from(ids)),
                 Arc::new(Int32Array::from(values)),
             ],
+        )
+        .unwrap()
+    }
+
+    fn make_vector_batch(ids: Vec<i32>, vectors: Vec<Vec<f32>>) -> RecordBatch {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field.clone());
+        for vector in vectors {
+            assert_eq!(vector.len(), 2);
+            for value in vector {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        let embedding = builder.finish();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(element_field, 2),
+                true,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(embedding)],
         )
         .unwrap()
     }
@@ -1154,6 +1242,79 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
+    }
+
+    async fn assert_vector_write_uses_dedicated_file(table_path: &str, vector_file_format: &str) {
+        let file_io = test_file_io();
+        setup_dirs(&file_io, table_path).await;
+
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_vector_table"),
+            table_path.to_string(),
+            test_vector_table_schema(vector_file_format),
+            None,
+        );
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let batch = make_vector_batch(
+            vec![1, 2, 3],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]],
+        );
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 2);
+
+        let vector_suffix = format!(".vector.{vector_file_format}");
+        let normal_files: Vec<_> = messages[0]
+            .new_files
+            .iter()
+            .filter(|f| !f.file_name.contains(".vector."))
+            .collect();
+        let vector_files: Vec<_> = messages[0]
+            .new_files
+            .iter()
+            .filter(|f| f.file_name.ends_with(&vector_suffix))
+            .collect();
+
+        assert_eq!(normal_files.len(), 1);
+        assert_eq!(vector_files.len(), 1);
+        assert_eq!(normal_files[0].row_count, 3);
+        assert_eq!(vector_files[0].row_count, 3);
+        assert_eq!(
+            vector_files[0].write_cols,
+            Some(vec!["embedding".to_string()])
+        );
+
+        TableCommit::new(table, "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(snapshot.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_vector_write_uses_dedicated_parquet_file() {
+        assert_vector_write_uses_dedicated_file(
+            "memory:/test_vector_write_dedicated_parquet",
+            "parquet",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "vortex")]
+    #[tokio::test]
+    async fn test_vector_write_uses_dedicated_vortex_file() {
+        assert_vector_write_uses_dedicated_file(
+            "memory:/test_vector_write_dedicated_vortex",
+            "vortex",
+        )
+        .await;
     }
 
     #[test]
