@@ -73,7 +73,7 @@ pub struct TableCommit {
 }
 
 impl TableCommit {
-    pub(crate) fn new(table: Table, commit_user: String) -> Self {
+    pub fn new(table: Table, commit_user: String) -> Self {
         let snapshot_manager = SnapshotManager::new(table.file_io.clone(), table.location.clone());
         let snapshot_commit = if let Some(env) = &table.rest_env {
             env.snapshot_commit()

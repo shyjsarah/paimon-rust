@@ -72,8 +72,7 @@ impl<'a> WriteBuilder<'a> {
 
     /// Create a new TableCommit for committing write results.
     pub fn new_commit(&self) -> TableCommit {
-        self.try_new_commit()
-            .expect("Cannot create TableCommit for a branch table")
+        TableCommit::new(self.table.clone(), self.commit_user.clone())
     }
 
     /// Try to create a new TableCommit for committing write results.
@@ -353,6 +352,19 @@ mod tests {
             matches!(write_err, crate::Error::Unsupported { ref message }
                 if message == "Writing to Paimon branch 'main' is not supported"),
             "Expected branch write rejection, got: {write_err:?}"
+        );
+
+        let commit_err = table
+            .new_write_builder()
+            .new_commit()
+            .commit(Vec::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(commit_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch commit rejection, got: {commit_err:?}"
         );
 
         let index_err = table
