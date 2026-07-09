@@ -367,6 +367,19 @@ mod tests {
                 if message == "Writing to Paimon branch 'main' is not supported"),
             "Expected branch index-build rejection, got: {index_err:?}"
         );
+
+        let index_drop_err = table
+            .new_global_index_drop_builder()
+            .with_index_column("value")
+            .execute()
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(index_drop_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch index-drop rejection, got: {index_drop_err:?}"
+        );
     }
 
     #[tokio::test]
