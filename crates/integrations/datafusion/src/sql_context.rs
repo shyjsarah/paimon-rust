@@ -67,6 +67,7 @@ use paimon::spec::{
 };
 
 use crate::error::to_datafusion_error;
+use crate::table_loader::load_table_for_read;
 use crate::{BlobReaderRegistry, DynamicOptions};
 
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
@@ -511,7 +512,7 @@ impl SQLContext {
                 self.resolve_table_name_from_ref(&table_ref)?;
 
             let (paimon_table, base_identifier, system_name) =
-                Self::load_table_for_read(&catalog, &identifier).await?;
+                load_table_for_read(&catalog, &identifier).await?;
 
             // Merge dynamic options with time-travel options
             let mut options = self.dynamic_options.read().unwrap().clone();
@@ -551,7 +552,7 @@ impl SQLContext {
                 self.resolve_table_name_from_ref(&table_ref)?;
 
             let (paimon_table, base_identifier, system_name) =
-                Self::load_table_for_read(&catalog, &identifier).await?;
+                load_table_for_read(&catalog, &identifier).await?;
 
             let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
 
@@ -667,37 +668,6 @@ impl SQLContext {
                 ))
             }
         }
-    }
-
-    async fn load_table_for_read(
-        catalog: &Arc<dyn Catalog>,
-        identifier: &Identifier,
-    ) -> DFResult<(paimon::table::Table, Identifier, Option<String>)> {
-        let parsed = identifier
-            .parsed_object_name()
-            .map_err(to_datafusion_error)?;
-        let base_identifier = Identifier::new(
-            identifier.database().to_string(),
-            parsed.table().to_string(),
-        );
-        let mut table = catalog
-            .get_table(&base_identifier)
-            .await
-            .map_err(to_datafusion_error)?;
-        let system_table = parsed.system_table().map(str::to_string);
-        if let Some(branch) = parsed.branch() {
-            let is_branches_table = system_table
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
-            if is_branches_table {
-                return Ok((table, base_identifier, system_table));
-            }
-            table = table
-                .copy_with_branch(branch)
-                .await
-                .map_err(to_datafusion_error)?;
-        }
-        Ok((table, base_identifier, system_table))
     }
 
     async fn handle_create_table(
