@@ -83,6 +83,14 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
+    /// Try to create a new TableCommit for committing write results.
+    pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.try_new_commit(),
+            WriteBuilderKind::Format(builder) => builder.try_new_commit(),
+        }
+    }
+
     /// Create a new TableWrite for writing Arrow data.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
         match &self.0 {
