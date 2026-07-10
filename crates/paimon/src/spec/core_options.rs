@@ -31,6 +31,8 @@ const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
+const FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION: &str =
+    "format-table.partition-path-only-value";
 pub(crate) const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 const BUCKET_OPTION: &str = "bucket";
@@ -54,6 +56,9 @@ const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+pub(crate) const TABLE_TYPE_OPTION: &str = "type";
+pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
+pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
@@ -382,6 +387,24 @@ impl<'a> CoreOptions<'a> {
     pub fn data_evolution_enabled(&self) -> bool {
         self.options
             .get(DATA_EVOLUTION_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    pub fn is_format_table(&self) -> bool {
+        self.options
+            .get(TABLE_TYPE_OPTION)
+            .map(|value| value.eq_ignore_ascii_case(FORMAT_TABLE_TYPE))
+            .unwrap_or(false)
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.options.get(PATH_OPTION).map(String::as_str)
+    }
+
+    pub fn format_table_partition_only_value_in_path(&self) -> bool {
+        self.options
+            .get(FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
@@ -1156,6 +1179,16 @@ mod tests {
         let core = CoreOptions::new(&options);
         assert_eq!(core.partition_default_name(), "NULL_PART");
         assert!(!core.legacy_partition_name());
+    }
+
+    #[test]
+    fn test_format_table_partition_only_value_in_path() {
+        let options = HashMap::from([(
+            FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION.to_string(),
+            "true".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert!(core.format_table_partition_only_value_in_path());
     }
 
     #[test]
