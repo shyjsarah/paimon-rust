@@ -447,6 +447,16 @@ impl SchemaProvider for PaimonSchemaProvider {
                     if branch.is_some() {
                         return Ok(None);
                     }
+                    // DataFusion preloads every relation name before planning, including
+                    // registered table functions. Do not reinterpret a missing UDTF name as
+                    // a REST view; the planner will resolve it through the UDTF registry.
+                    if session_state
+                        .as_ref()
+                        .and_then(|provider| provider())
+                        .is_some_and(|state| state.table_functions().contains_key(identifier.object()))
+                    {
+                        return Ok(None);
+                    }
                     let view = match catalog.get_view(&identifier).await {
                         Ok(view) => view,
                         Err(paimon::Error::ViewNotExist { .. })

@@ -5275,6 +5275,8 @@ mod tests {
     struct ProbeTrackingCatalog {
         get_calls: std::sync::atomic::AtomicUsize,
         create_calls: std::sync::atomic::AtomicUsize,
+        get_view_calls: std::sync::atomic::AtomicUsize,
+        table_identifiers: std::sync::Mutex<Vec<String>>,
     }
 
     impl ProbeTrackingCatalog {
@@ -5282,6 +5284,8 @@ mod tests {
             Self {
                 get_calls: std::sync::atomic::AtomicUsize::new(0),
                 create_calls: std::sync::atomic::AtomicUsize::new(0),
+                get_view_calls: std::sync::atomic::AtomicUsize::new(0),
+                table_identifiers: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn get_count(&self) -> usize {
@@ -5289,6 +5293,13 @@ mod tests {
         }
         fn create_count(&self) -> usize {
             self.create_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn get_view_count(&self) -> usize {
+            self.get_view_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn table_identifiers(&self) -> Vec<String> {
+            self.table_identifiers.lock().unwrap().clone()
         }
     }
 
@@ -5307,9 +5318,12 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-        async fn get_database(&self, _name: &str) -> paimon::Result<Database> {
+        async fn get_database(&self, name: &str) -> paimon::Result<Database> {
             self.get_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if name == "analytics" {
+                return Ok(Database::new(name.to_string(), HashMap::new(), None));
+            }
             Err(paimon::Error::Unsupported {
                 message: "simulated Forbidden".to_string(),
             })
@@ -5323,6 +5337,10 @@ mod tests {
             Ok(())
         }
         async fn get_table(&self, identifier: &Identifier) -> paimon::Result<Table> {
+            self.table_identifiers
+                .lock()
+                .unwrap()
+                .push(identifier.to_string());
             Err(paimon::Error::TableNotExist {
                 full_name: identifier.to_string(),
             })
@@ -5360,6 +5378,19 @@ mod tests {
             _ignore_if_not_exists: bool,
         ) -> paimon::Result<()> {
             Ok(())
+        }
+
+        async fn get_view(
+            &self,
+            _identifier: &Identifier,
+        ) -> paimon::Result<paimon::catalog::View> {
+            self.get_view_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(paimon::Error::RestApi {
+                source: paimon::api::RestError::Forbidden {
+                    message: "view access is forbidden".to_string(),
+                },
+            })
         }
     }
 
@@ -5441,6 +5472,43 @@ mod tests {
         assert!(
             msg.contains("default") && msg.contains("bare"),
             "error must surface the fallback 'default' namespace + bare name, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_table_function_skips_view_lookup_during_relation_preload() {
+        let catalog = Arc::new(ProbeTrackingCatalog::new());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", catalog.clone(), None)
+            .await
+            .unwrap();
+        ctx.set_current_database("analytics").await.unwrap();
+
+        let _ = ctx
+            .sql(
+                "SELECT *
+                 FROM vector_search(
+                   'paimon.analytics.documents',
+                   'embedding',
+                   '[0.1, 0.2]',
+                   3
+                 )",
+            )
+            .await
+            .expect_err("the target table is intentionally absent");
+
+        assert_eq!(
+            catalog.table_identifiers(),
+            vec![
+                "analytics.vector_search",
+                "analytics.documents"
+            ],
+            "DataFusion may preload the UDTF name, then the function must resolve its table argument"
+        );
+        assert_eq!(
+            catalog.get_view_count(),
+            0,
+            "registered table functions must not be resolved as REST catalog views"
         );
     }
 
