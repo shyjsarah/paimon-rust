@@ -1880,6 +1880,13 @@ Set via `WITH ('key' = 'value')` at table creation time, or dynamically via `SET
 | `'merge-engine' = 'partial-update'` | Basic partial-update engine for PK tables |
 | `'merge-engine' = 'aggregation'` | Basic aggregation engine for PK tables |
 
+Rust can read fully materialized compacted files from deletion-vector-enabled
+partial-update and aggregation tables. Every split must be raw-convertible,
+every file must have a known zero delete-row count, and
+`deletion-vectors.merge-on-read` must remain disabled. Writing these table
+combinations and reading plans that still require per-key merging are not
+supported.
+
 Rust currently supports `merge-engine=aggregation` in basic mode only. It works
 with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
 primary key includes all partition columns. It supports per-field aggregate
@@ -1891,9 +1898,10 @@ Sequence fields are always merged with `last_value`. Defining
 validation.
 
 This is not full Java feature parity. Aggregation tables do not support retract
-rows (`DELETE` / `UPDATE_BEFORE`), deletion vectors, cross-partition dynamic
-bucket writes, or advanced aggregation options such as `ignore-retract`,
-`distinct`, `nested-key`, `count-limit`, and sequence groups.
+rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
+plans, cross-partition dynamic bucket writes, or advanced aggregation options
+such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
+groups.
 
 ### Global Index Options
 
