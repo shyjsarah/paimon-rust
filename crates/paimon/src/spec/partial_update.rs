@@ -138,7 +138,7 @@ impl<'a> PartialUpdateConfig<'a> {
             .iter()
             .filter(|(key, _)| is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX))
             .collect();
-        options.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        options.sort_by_key(|(key, _)| *key);
 
         options
             .into_iter()
