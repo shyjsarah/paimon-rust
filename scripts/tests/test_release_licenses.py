@@ -73,6 +73,10 @@ class LicenseCorrectionsTest(unittest.TestCase):
                 license_name="MIT License (jieba-rs workspace)",
                 anchor="mit-jieba-rs-workspace",
                 license_from_repository=True,
+                expected_versions=(
+                    ("jieba-macros", "0.10.3"),
+                    ("jieba-rs", "0.10.3"),
+                ),
             )
 
             result = correction_html(root, metadata, correction)
@@ -80,6 +84,35 @@ class LicenseCorrectionsTest(unittest.TestCase):
             self.assertIn("Jieba workspace license", result)
             self.assertIn("jieba-macros 0.10.3", result)
             self.assertIn("jieba-rs 0.10.3", result)
+
+    def test_repository_license_correction_rejects_unverified_version(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        correction = next(
+            correction
+            for correction in PYTHON_MIT_CORRECTIONS
+            if correction.crates == ("jieba-macros", "jieba-rs")
+        )
+        metadata = {
+            "normal_packages": {
+                ("jieba-macros", "9.9.9"),
+                ("jieba-rs", "9.9.9"),
+            },
+            "packages": [
+                {
+                    "name": name,
+                    "version": "9.9.9",
+                    "manifest_path": str(root / name / "Cargo.toml"),
+                    "repository": "https://example.com/jieba-rs",
+                }
+                for name in ("jieba-macros", "jieba-rs")
+            ],
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"expected jieba-macros 0\.10\.3, found 9\.9\.9",
+        ):
+            correction_html(root, metadata, correction)
 
     def test_correction_supports_multiple_versions_with_same_license(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

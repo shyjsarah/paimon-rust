@@ -62,6 +62,7 @@ class LicenseCorrection:
     license_name: str
     anchor: str
     license_from_repository: bool = False
+    expected_versions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,10 @@ PYTHON_MIT_CORRECTIONS = (
         license_name="MIT License (jieba-rs workspace)",
         anchor="mit-jieba-rs-workspace",
         license_from_repository=True,
+        expected_versions=(
+            ("jieba-macros", "0.10.3"),
+            ("jieba-rs", "0.10.3"),
+        ),
     ),
     LicenseCorrection(
         crates=(
@@ -387,12 +392,25 @@ def package_features(metadata: dict, package: dict) -> set[str]:
 def correction_html(
     root: Path, metadata: dict, correction: LicenseCorrection
 ) -> str:
+    expected_versions = dict(correction.expected_versions)
     used_by = []
     for crate_name in correction.crates:
         packages = packages_by_name(metadata, crate_name)
         if not packages:
             raise RuntimeError(f"expected at least one resolved {crate_name} package")
         for package in packages:
+            if correction.license_from_repository:
+                expected_version = expected_versions.get(crate_name)
+                if expected_version is None:
+                    raise RuntimeError(
+                        "repository-backed correction is missing an expected "
+                        f"version for {crate_name}"
+                    )
+                if package["version"] != expected_version:
+                    raise RuntimeError(
+                        f"expected {crate_name} {expected_version}, "
+                        f"found {package['version']}"
+                    )
             repository = package.get("repository") or (
                 f"https://crates.io/crates/{crate_name}"
             )
