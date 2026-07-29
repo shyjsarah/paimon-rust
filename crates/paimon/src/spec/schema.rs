@@ -255,6 +255,7 @@ impl TableSchema {
                             message: format!("Cannot rename partition column: [{name}]"),
                         });
                     }
+                    assert_not_updating_primary_key_index_column(&self.options, name, "rename")?;
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -302,6 +303,7 @@ impl TableSchema {
                             ),
                         });
                     }
+                    assert_not_updating_primary_key_index_column(&self.options, name, "drop")?;
                     // Dropping a column referenced by `bucket-key` / `sequence.field`
                     // would silently break bucket assignment / sequence ordering on
                     // existing data (e.g. `bucket_key_indices` becomes empty and writes
@@ -355,6 +357,11 @@ impl TableSchema {
                             message: "Cannot update primary key".to_string(),
                         });
                     }
+                    assert_not_updating_primary_key_index_column(
+                        &self.options,
+                        name,
+                        "update type of",
+                    )?;
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -489,6 +496,12 @@ impl TableSchema {
             &new_schema.primary_keys,
             &new_schema.fields,
         )?;
+        Schema::validate_bucket_keys(
+            &new_schema.options,
+            &new_schema.fields,
+            &new_schema.partition_keys,
+            &new_schema.primary_keys,
+        )?;
         Schema::validate_read_batch_size(&new_schema.options)?;
         Ok(new_schema)
     }
@@ -557,6 +570,35 @@ fn assert_nullability_change(
                  You can set table configuration option 'alter-column-null-to-not-null.disabled' = 'false' \
                  to allow converting null columns to not null"
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Reject destructive changes to columns referenced by a primary-key index.
+///
+/// The index metadata and existing index files are tied to the original column
+/// name and type. Mirrors Java
+/// `SchemaManager.assertNotUpdatingPrimaryKeyIndexColumn`.
+fn assert_not_updating_primary_key_index_column(
+    options: &HashMap<String, String>,
+    field_name: &str,
+    operation: &str,
+) -> crate::Result<()> {
+    let core_options = CoreOptions::new(options);
+    let is_vector_index_column = core_options.primary_key_vector_index_enabled()
+        && core_options
+            .primary_key_vector_index_columns()?
+            .iter()
+            .any(|column| column == field_name);
+    let is_full_text_index_column = core_options
+        .primary_key_full_text_index_columns()
+        .iter()
+        .any(|column| column == field_name);
+
+    if is_vector_index_column || is_full_text_index_column {
+        return Err(crate::Error::Unsupported {
+            message: format!("Cannot {operation} primary-key index column: [{field_name}]"),
         });
     }
     Ok(())
@@ -936,6 +978,7 @@ impl Schema {
         AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
         Self::validate_rowkind_field(&options, &primary_keys, &fields)?;
+        Self::validate_bucket_keys(&options, &fields, &partition_keys, &primary_keys)?;
         Self::validate_read_batch_size(&options)?;
 
         Ok(Self {
@@ -1346,6 +1389,57 @@ impl Schema {
                     "rowkind.field '{field_name}' must be STRING (unbounded VARCHAR) type"
                 ),
             });
+        }
+
+        Ok(())
+    }
+
+    /// Validate the explicit `bucket-key` option against the schema, mirroring
+    /// Java `TableSchema#originalBucketKeys`. A bucket key that is missing,
+    /// partitioned, or outside the primary key otherwise resolves to no field
+    /// index in `TableWrite`, which silently degrades to a constant bucket 0
+    /// assigner instead of hashing.
+    fn validate_bucket_keys(
+        options: &HashMap<String, String>,
+        fields: &[DataField],
+        partition_keys: &[String],
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        let Some(bucket_keys) = CoreOptions::new(options).bucket_key() else {
+            return Ok(());
+        };
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for key in &bucket_keys {
+            if fields.iter().all(|f| f.name() != key) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Field names should contain all bucket keys, but bucket key '{key}' \
+                         can not be found in table schema."
+                    ),
+                });
+            }
+            if !seen.insert(key.as_str()) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Bucket key '{key}' is defined repeatedly."),
+                });
+            }
+            if partition_keys.contains(key) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Bucket keys should not be in partition keys, but bucket key '{key}' \
+                         is a partition field."
+                    ),
+                });
+            }
+            if !primary_keys.is_empty() && !primary_keys.contains(key) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Primary keys {primary_keys:?} should contain all bucket keys, but \
+                         bucket key '{key}' is not a primary key field."
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -2920,6 +3014,236 @@ mod tests {
         assert_eq!(
             new_schema.options().get("fields.tag.list-agg-delimiter"),
             None
+        );
+    }
+
+    fn assert_primary_key_index_column_changes_rejected(
+        table_schema: &TableSchema,
+        column_name: &str,
+        new_data_type: DataType,
+    ) {
+        let changes = [
+            (
+                crate::spec::SchemaChange::rename_column(
+                    column_name.to_string(),
+                    format!("renamed_{column_name}"),
+                ),
+                format!("Cannot rename primary-key index column: [{column_name}]"),
+            ),
+            (
+                crate::spec::SchemaChange::drop_column(column_name.to_string()),
+                format!("Cannot drop primary-key index column: [{column_name}]"),
+            ),
+            (
+                crate::spec::SchemaChange::update_column_type(
+                    column_name.to_string(),
+                    new_data_type,
+                ),
+                format!("Cannot update type of primary-key index column: [{column_name}]"),
+            ),
+        ];
+
+        for (change, expected_message) in changes {
+            let err = table_schema.apply_changes(vec![change]).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message == &expected_message),
+                "expected primary-key index guard, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_destructive_primary_key_full_text_index_column_changes() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("content", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("deletion-vectors.enabled", "true")
+                .option("pk-full-text.index.columns", "content")
+                .build()
+                .unwrap(),
+        );
+
+        assert_primary_key_index_column_changes_rejected(
+            &table_schema,
+            "content",
+            DataType::Int(IntType::new()),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![
+                crate::spec::SchemaChange::remove_option("pk-full-text.index.columns".to_string()),
+                crate::spec::SchemaChange::rename_column(
+                    "content".to_string(),
+                    "renamed_content".to_string(),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { ref message }
+                if message == "Cannot rename primary-key index column: [content]"
+        ));
+    }
+
+    #[test]
+    fn test_rejects_destructive_primary_key_vector_index_column_changes() {
+        let vector_type = DataType::Vector(
+            VectorType::try_new(true, 3, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_type.clone())
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("deletion-vectors.enabled", "true")
+                .option("pk-vector.index.columns", "embedding")
+                .option("fields.embedding.pk-vector.index.type", "ivf_flat")
+                .option("fields.embedding.pk-vector.distance.metric", "l2")
+                .build()
+                .unwrap(),
+        );
+
+        assert_primary_key_index_column_changes_rejected(&table_schema, "embedding", vector_type);
+    }
+
+    #[test]
+    fn test_create_schema_rejects_unknown_bucket_key() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .option("bucket", "4")
+            // typo: `nmae` instead of `name`
+            .option("bucket-key", "nmae")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("nmae") && message.contains("can not be found")),
+            "bucket key missing from the schema should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_repeated_bucket_key() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .option("bucket", "4")
+            .option("bucket-key", "name,name")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("name") && message.contains("repeatedly")),
+            "repeated bucket key should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_partitioned_bucket_key() {
+        let err = Schema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .option("bucket", "4")
+            .option("bucket-key", "pt")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("pt") && message.contains("partition")),
+            "partition field used as bucket key should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_bucket_key_outside_primary_key() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "4")
+            .option("bucket-key", "name")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("name") && message.contains("primary key")),
+            "non-primary-key bucket key on a PK table should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_accepts_bucket_key_subset_of_primary_key() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("v", DataType::Int(IntType::new()))
+            .primary_key(["id", "name"])
+            .option("bucket", "4")
+            .option("bucket-key", "id")
+            .build();
+
+        assert!(
+            schema.is_ok(),
+            "a bucket key that is a primary key field should be accepted, got {schema:?}"
+        );
+    }
+
+    #[test]
+    fn test_blank_bucket_key_falls_back_to_primary_keys() {
+        // A blank option must not resolve to a `""` column: `TableWrite` would
+        // find no field index for it and silently write every row to bucket 0.
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("bucket", "4")
+                .option("bucket-key", "  ")
+                .build()
+                .unwrap(),
+        );
+
+        assert_eq!(table_schema.bucket_keys(), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn test_alter_set_unknown_bucket_key_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::string_type()))
+                .option("bucket", "4")
+                .option("bucket-key", "name")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                BUCKET_KEY_OPTION.to_string(),
+                "nmae".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("nmae") && message.contains("can not be found")),
+            "alter setting an unknown bucket key should be rejected, got {err:?}"
         );
     }
 
