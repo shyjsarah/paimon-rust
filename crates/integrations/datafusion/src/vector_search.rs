@@ -45,8 +45,6 @@ use futures::{stream, TryStreamExt};
 use paimon::catalog::Catalog;
 use paimon::spec::{
     BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
-    SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
-    SCAN_VERSION_OPTION,
 };
 use paimon::table::Table;
 
@@ -139,14 +137,17 @@ impl TableFunctionImpl for VectorSearchFunction {
             parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
 
         let catalog = Arc::clone(&self.catalog);
-        let dynamic_options = vector_search_dynamic_options(&self.dynamic_options);
+        let dynamic_options = self.dynamic_options.read().unwrap().clone();
         let table = block_on_with_runtime(
             async move {
                 let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
                 let table = if dynamic_options.is_empty() {
                     table
                 } else {
-                    table.copy_with_options(dynamic_options)
+                    table
+                        .copy_with_time_travel(dynamic_options)
+                        .await
+                        .map_err(to_datafusion_error)?
                 };
                 Ok::<_, DataFusionError>(table)
             },
@@ -461,21 +462,6 @@ impl ExecutionPlan for VectorSearchExec {
     }
 }
 
-/// Vector search currently resolves candidates from the latest snapshot, so forwarding a
-/// time-travel selector would search one snapshot and materialize rows from another.
-fn vector_search_dynamic_options(dynamic_options: &DynamicOptions) -> HashMap<String, String> {
-    let mut options = dynamic_options.read().unwrap().clone();
-    for key in [
-        SCAN_VERSION_OPTION,
-        SCAN_TIMESTAMP_MILLIS_OPTION,
-        SCAN_SNAPSHOT_ID_OPTION,
-        SCAN_TAG_NAME_OPTION,
-    ] {
-        options.remove(key);
-    }
-    options
-}
-
 /// Projected user columns (+ internal `_ROW_ID`, needed to realign rows to rank).
 /// Errors if the table has no row tracking, since results then can't be ordered.
 fn projected_read_fields(
@@ -590,6 +576,7 @@ fn gather_rows_by_rank(
 mod tests {
     use datafusion::catalog::TableFunctionArgs;
     use datafusion::logical_expr::lit;
+    use paimon::spec::SCAN_VERSION_OPTION;
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
 
     use super::*;
@@ -624,6 +611,13 @@ mod tests {
             .await
             .unwrap();
         sql_context
+            .sql("INSERT INTO paimon.default.vector_blob (id) VALUES (1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        sql_context
             .sql("SET 'paimon.blob-as-descriptor' = 'true'")
             .await
             .unwrap();
@@ -655,13 +649,22 @@ mod tests {
             "vector_search should apply session dynamic options to the loaded table"
         );
         assert!(
-            !provider
+            provider
                 .inner
                 .table()
                 .schema()
                 .options()
                 .contains_key(SCAN_VERSION_OPTION),
-            "vector_search should not forward unsupported time-travel options"
+            "vector_search should keep session time-travel options"
+        );
+        assert_eq!(
+            provider
+                .inner
+                .table()
+                .travel_snapshot()
+                .map(|snapshot| snapshot.id()),
+            Some(1),
+            "vector_search should resolve the session time-travel snapshot"
         );
     }
 }
