@@ -4603,7 +4603,7 @@ dependencies = [
  "orc-rust",
  "paimon-ftindex-core",
  "paimon-mosaic-core",
- "paimon-vindex-core 0.4.0",
+ "paimon-vindex-core",
  "parquet",
  "pretty_assertions",
  "rand 0.8.7",
@@ -4641,7 +4641,7 @@ dependencies = [
  "bytes",
  "futures",
  "paimon",
- "paimon-vindex-core 0.3.0",
+ "paimon-vindex-core",
  "serde_json",
  "tokio",
 ]
@@ -4747,20 +4747,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "paimon-vindex-core"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2c67c916596e578ed09f78ace8b4c54fc45d262933c658e1ca7fdb61b722635"
-dependencies = [
- "half",
- "matrixmultiply",
- "nalgebra",
- "rand 0.8.7",
- "rayon",
- "roaring",
 ]
 
 [[package]]
