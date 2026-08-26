@@ -60,7 +60,7 @@ pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
     fields
 }
 
-fn datafusion_arrow_schema(
+pub(crate) fn datafusion_arrow_schema(
     fields: &[DataField],
     schema_force_view_types: bool,
 ) -> DFResult<ArrowSchemaRef> {

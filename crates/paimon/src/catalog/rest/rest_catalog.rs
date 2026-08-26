@@ -221,8 +221,9 @@ impl Catalog for RESTCatalog {
             let options = crate::spec::CoreOptions::new(schema.options());
             let declared = options.table_type()?;
             if declared.requires_table_engine() {
-                return crate::catalog::LoadedTable::external(
+                return crate::catalog::LoadedTable::external_with_fields(
                     declared,
+                    schema.fields().to_vec(),
                     &options,
                     &identifier.full_name(),
                 );

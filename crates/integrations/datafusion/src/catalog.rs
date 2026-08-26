@@ -154,6 +154,58 @@ impl TableProvider for ReadOnlyTableProvider {
     }
 }
 
+/// Metadata-only provider for an external table whose engine is not registered.
+///
+/// DataFusion's information schema asks every catalog table for its schema.
+/// Returning this provider keeps those metadata queries available without
+/// weakening the fail-closed behavior for actual table reads or writes.
+#[derive(Debug)]
+struct UnavailableEngineTableProvider {
+    schema: datafusion::arrow::datatypes::SchemaRef,
+    declared: PaimonTableType,
+    table_name: String,
+}
+
+impl UnavailableEngineTableProvider {
+    fn unavailable_error(&self) -> datafusion::error::DataFusionError {
+        plan_datafusion_err!(
+            "no table engine is registered for '{}' tables ('{}')",
+            self.declared,
+            self.table_name
+        )
+    }
+}
+
+#[async_trait]
+impl TableProvider for UnavailableEngineTableProvider {
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(self.unavailable_error())
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(self.unavailable_error())
+    }
+}
+
 /// Register `resolver` as the engine for `table_type` on the Paimon catalog
 /// named `catalog_name`.
 ///
@@ -683,13 +735,20 @@ impl SchemaProvider for PaimonSchemaProvider {
                     paimon::spec::CoreOptions::new(&session_options)
                         .ensure_engine_can_serve(&identifier.full_name())
                         .map_err(to_datafusion_error)?;
-                    let resolver = table_engines.get(&declared).ok_or_else(|| {
-                        plan_datafusion_err!(
-                            "no table engine is registered for '{}' tables ('{}')",
+                    let Some(resolver) = table_engines.get(&declared) else {
+                        let schema = match external.fields() {
+                            Some(fields) => crate::table::datafusion_arrow_schema(
+                                fields,
+                                schema_force_view_types,
+                            )?,
+                            None => Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+                        };
+                        return Ok(Some(Arc::new(UnavailableEngineTableProvider {
+                            schema,
                             declared,
-                            identifier.full_name()
-                        )
-                    })?;
+                            table_name: identifier.full_name(),
+                        }) as Arc<dyn TableProvider>));
+                    };
                     let resolved = resolver
                         .resolve_table(&EngineTableRequest::new(
                             identifier.database().to_string(),
