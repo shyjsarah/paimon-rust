@@ -57,6 +57,7 @@ mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
+mod object_table;
 mod partition_filter;
 mod partition_stat;
 #[cfg(feature = "fulltext")]
@@ -125,6 +126,7 @@ pub use incremental_scan::{
     IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
+pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_stat::PartitionStat;
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
 pub use postpone_fixed_bucket_write::{
