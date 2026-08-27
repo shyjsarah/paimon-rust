@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::error::*;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
@@ -26,6 +27,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
 use opendal::raw::normalize_root;
 use opendal::Operator;
 use snafu::ResultExt;
@@ -223,14 +225,26 @@ impl FileIO {
 
     /// List all files recursively under the given directory path.
     pub async fn list_status_recursive(&self, path: &str) -> Result<Vec<FileStatus>> {
+        self.list_status_recursive_with_limit(path, None).await
+    }
+
+    pub(crate) async fn list_status_recursive_with_limit(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<FileStatus>> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+
         let (op, relative_path) = self.create(path).await?;
         // See `list_status`: `relative_path` is a byte-suffix of `path` except
         // for Windows local paths, where it only swaps separators (same length).
         let base_path = &path[..path.len() - relative_path.len()];
         let list_path = normalize_root(relative_path.as_ref());
 
-        let entries =
-            op.list_with(&list_path)
+        let mut entries =
+            op.lister_with(&list_path)
                 .recursive(true)
                 .await
                 .context(IoUnexpectedSnafu {
@@ -238,8 +252,11 @@ impl FileIO {
                 })?;
 
         let mut statuses = Vec::new();
+        let mut smallest = limit.map(|limit| BinaryHeap::with_capacity(limit.saturating_add(1)));
         let list_path_normalized = list_path.trim_start_matches('/');
-        for entry in entries {
+        while let Some(entry) = entries.try_next().await.context(IoUnexpectedSnafu {
+            message: format!("Failed to list files recursively in '{path}'"),
+        })? {
             let entry_path = entry.path();
             if entry_path.trim_start_matches('/') == list_path_normalized {
                 continue;
@@ -248,14 +265,29 @@ impl FileIO {
             if meta.is_dir() {
                 continue;
             }
-            statuses.push(FileStatus {
+            let status = FileStatus {
                 size: meta.content_length(),
                 is_dir: false,
                 path: status_path(base_path, entry_path),
                 last_modified: meta
                     .last_modified()
                     .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
-            });
+            };
+            match (&mut smallest, limit) {
+                (Some(heap), Some(limit)) => {
+                    heap.push(PathOrderedStatus(status));
+                    if heap.len() > limit {
+                        heap.pop();
+                    }
+                }
+                _ => statuses.push(status),
+            }
+        }
+        if let Some(heap) = smallest {
+            statuses = heap
+                .into_iter()
+                .map(|PathOrderedStatus(status)| status)
+                .collect();
         }
 
         Ok(statuses)
@@ -598,6 +630,29 @@ pub struct FileStatus {
     pub is_dir: bool,
     pub path: String,
     pub last_modified: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+struct PathOrderedStatus(FileStatus);
+
+impl PartialEq for PathOrderedStatus {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.path == other.0.path
+    }
+}
+
+impl Eq for PathOrderedStatus {}
+
+impl PartialOrd for PathOrderedStatus {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PathOrderedStatus {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.path.cmp(&other.0.path)
+    }
 }
 
 #[derive(Debug)]

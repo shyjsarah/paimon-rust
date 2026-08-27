@@ -813,6 +813,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                     )) as Arc<dyn TableProvider>))
                 }
                 Err(e) => Err(to_datafusion_error(e)),
+                Ok(_) => Err(plan_datafusion_err!(
+                    "catalog returned an unsupported loaded table kind for '{}'",
+                    identifier.full_name()
+                )),
             }
         })
         .await
@@ -932,6 +936,13 @@ impl SchemaProvider for PaimonSchemaProvider {
                     }
                     Err(e) => {
                         log::error!("failed to check table '{}': {e}", identifier);
+                        false
+                    }
+                    Ok(_) => {
+                        log::error!(
+                            "catalog returned an unsupported loaded table kind for '{}'",
+                            identifier
+                        );
                         false
                     }
                 }

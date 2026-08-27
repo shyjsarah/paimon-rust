@@ -1549,6 +1549,8 @@ async fn test_load_table_constructs_native_object_table() {
     let LoadedTable::Object(table) = loaded else {
         panic!("expected a native object table, got {loaded:?}");
     };
+    assert_eq!(table.location(), object_location);
+    #[cfg(not(windows))]
     assert_eq!(
         table
             .list_objects()

@@ -100,6 +100,22 @@ async fn object_table_lists_files_recursively() {
         ]
     );
 
+    let limited = ctx
+        .sql("SELECT path FROM cat.db.objects LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        limited.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        array_value_to_string(limited[0].column(0).as_ref(), 0).unwrap(),
+        "nested/child.bin"
+    );
+
     let error = ctx
         .sql(
             "INSERT INTO cat.db.objects \

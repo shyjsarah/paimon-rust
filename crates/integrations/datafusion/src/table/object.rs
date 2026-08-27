@@ -66,14 +66,11 @@ impl TableProvider for ObjectTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mut entries = self
+        let entries = self
             .table
-            .list_objects()
+            .list_objects_with_limit(limit)
             .await
             .map_err(to_datafusion_error)?;
-        if let Some(limit) = limit {
-            entries.truncate(limit);
-        }
 
         let paths = entries
             .iter()

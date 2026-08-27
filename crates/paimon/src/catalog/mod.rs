@@ -267,6 +267,7 @@ use crate::table::{ObjectTable, Table};
 
 /// Outcome of [`Catalog::load_table`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoadedTable {
     /// A constructed Paimon table (boxed: far larger than the other variant).
     Paimon(Box<Table>),

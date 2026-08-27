@@ -18,7 +18,8 @@
 use crate::catalog::Identifier;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, CoreOptions, DataField, DataType, TableSchema, TableType, VarCharType,
+    BigIntType, CoreOptions, DataField, DataType, Schema, TableSchema, TableType, VarCharType,
+    PATH_OPTION,
 };
 use crate::{Error, Result};
 
@@ -69,7 +70,38 @@ pub struct ObjectTable {
 }
 
 impl ObjectTable {
+    pub(crate) fn normalize_creation(schema: &Schema, default_location: &str) -> Result<Schema> {
+        let mut options = schema.options().clone();
+        if !options
+            .get(PATH_OPTION)
+            .is_some_and(|path| !path.trim().is_empty())
+        {
+            options.insert(PATH_OPTION.to_string(), default_location.to_string());
+        }
+
+        let mut builder = Schema::builder()
+            .options(options)
+            .comment(schema.comment().map(str::to_string));
+        for field in Self::fields() {
+            builder = builder.column_with_description(
+                field.name().to_string(),
+                field.data_type().clone(),
+                field.description().map(str::to_string),
+            );
+        }
+        builder.build()
+    }
+
     pub fn try_new(file_io: FileIO, identifier: Identifier, schema: &TableSchema) -> Result<Self> {
+        Self::try_new_with_default_location(file_io, identifier, schema, None)
+    }
+
+    pub(crate) fn try_new_with_default_location(
+        file_io: FileIO,
+        identifier: Identifier,
+        schema: &TableSchema,
+        default_location: Option<&str>,
+    ) -> Result<Self> {
         let options = CoreOptions::new(schema.options());
         if options.table_type()? != TableType::ObjectTable {
             return Err(Error::Unsupported {
@@ -83,6 +115,7 @@ impl ObjectTable {
         let location = options
             .path()
             .filter(|path| !path.trim().is_empty())
+            .or_else(|| default_location.filter(|path| !path.trim().is_empty()))
             .ok_or_else(|| Error::ConfigInvalid {
                 message: format!(
                     "Object table '{}' requires a non-empty 'path' option",
@@ -164,9 +197,19 @@ impl ObjectTable {
 
     /// Recursively list all files under the object location.
     pub async fn list_objects(&self) -> Result<Vec<ObjectEntry>> {
+        self.list_objects_with_limit(None).await
+    }
+
+    /// Recursively list files under the object location, retaining at most the
+    /// lexicographically smallest `limit` paths when one is supplied.
+    pub async fn list_objects_with_limit(&self, limit: Option<usize>) -> Result<Vec<ObjectEntry>> {
         let mut entries = Vec::new();
         let location_path = normalized_path(&self.location);
-        for status in self.file_io.list_status_recursive(&self.location).await? {
+        for status in self
+            .file_io
+            .list_status_recursive_with_limit(&self.location, limit)
+            .await?
+        {
             let status_path = normalized_path(&status.path);
             let relative = status_path
                 .strip_prefix(&location_path)
@@ -222,5 +265,47 @@ fn trim_trailing_slashes(value: &str) -> String {
         "/".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn list_objects_with_limit_keeps_path_smallest_entries() {
+        let location = "memory:/objects";
+        let file_io = FileIO::from_path(location).unwrap().build().unwrap();
+        for path in ["z.txt", "nested/b.txt", "a.txt", "nested/a.txt"] {
+            file_io
+                .new_output(&format!("{location}/{path}"))
+                .unwrap()
+                .write(Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let schema = Schema::builder()
+            .column("ignored", DataType::BigInt(BigIntType::new()))
+            .option("type", "object-table")
+            .option(PATH_OPTION, location)
+            .build()
+            .unwrap();
+        let table = ObjectTable::try_new(
+            file_io,
+            Identifier::new("db", "objects"),
+            &TableSchema::new(0, &schema),
+        )
+        .unwrap();
+
+        let paths = table
+            .list_objects_with_limit(Some(2))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["a.txt", "nested/a.txt"]);
     }
 }
