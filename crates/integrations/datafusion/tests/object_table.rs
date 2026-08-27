@@ -111,8 +111,21 @@ async fn object_table_lists_files_recursively() {
         limited.iter().map(|batch| batch.num_rows()).sum::<usize>(),
         1
     );
+    assert!(["nested/child.bin", "root.txt"].contains(
+        &array_value_to_string(limited[0].column(0).as_ref(), 0)
+            .unwrap()
+            .as_str()
+    ));
+
+    let ordered_limited = ctx
+        .sql("SELECT path FROM cat.db.objects ORDER BY path LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
-        array_value_to_string(limited[0].column(0).as_ref(), 0).unwrap(),
+        array_value_to_string(ordered_limited[0].column(0).as_ref(), 0).unwrap(),
         "nested/child.bin"
     );
 

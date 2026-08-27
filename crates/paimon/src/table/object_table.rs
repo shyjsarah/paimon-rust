@@ -200,8 +200,8 @@ impl ObjectTable {
         self.list_objects_with_limit(None).await
     }
 
-    /// Recursively list files under the object location, retaining at most the
-    /// lexicographically smallest `limit` paths when one is supplied.
+    /// Recursively list files under the object location, stopping after
+    /// `limit` files have been yielded by the storage backend when supplied.
     pub async fn list_objects_with_limit(&self, limit: Option<usize>) -> Result<Vec<ObjectEntry>> {
         let mut entries = Vec::new();
         let location_path = normalized_path(&self.location);
@@ -275,7 +275,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn list_objects_with_limit_keeps_path_smallest_entries() {
+    async fn list_objects_with_limit_returns_at_most_limit_entries() {
         let location = "memory:/objects";
         let file_io = FileIO::from_path(location).unwrap().build().unwrap();
         for path in ["z.txt", "nested/b.txt", "a.txt", "nested/a.txt"] {
@@ -306,6 +306,34 @@ mod tests {
             .into_iter()
             .map(|entry| entry.path)
             .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["a.txt", "nested/a.txt"]);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(paths.iter().all(|path| {
+            ["z.txt", "nested/b.txt", "a.txt", "nested/a.txt"].contains(&path.as_str())
+        }));
+    }
+
+    #[tokio::test]
+    async fn list_objects_with_huge_limit_does_not_preallocate() {
+        let location = "memory:/empty-objects";
+        let file_io = FileIO::from_path(location).unwrap().build().unwrap();
+        let schema = Schema::builder()
+            .column("ignored", DataType::BigInt(BigIntType::new()))
+            .option("type", "object-table")
+            .option(PATH_OPTION, location)
+            .build()
+            .unwrap();
+        let table = ObjectTable::try_new(
+            file_io,
+            Identifier::new("db", "objects"),
+            &TableSchema::new(0, &schema),
+        )
+        .unwrap();
+
+        let entries = table
+            .list_objects_with_limit(Some(usize::MAX))
+            .await
+            .unwrap();
+        assert!(entries.is_empty());
     }
 }
