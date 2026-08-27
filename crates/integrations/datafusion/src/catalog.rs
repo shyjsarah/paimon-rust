@@ -726,15 +726,6 @@ impl SchemaProvider for PaimonSchemaProvider {
                             identifier.full_name()
                         ));
                     }
-                    // The Paimon arm below applies these; an engine would
-                    // ignore them and answer from current data.
-                    let session_options = dynamic_options
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    paimon::spec::CoreOptions::new(&session_options)
-                        .ensure_engine_can_serve(&identifier.full_name())
-                        .map_err(to_datafusion_error)?;
                     let Some(resolver) = table_engines.get(&declared) else {
                         let schema = match external.fields() {
                             Some(fields) => crate::table::datafusion_arrow_schema(
@@ -749,6 +740,17 @@ impl SchemaProvider for PaimonSchemaProvider {
                             table_name: identifier.full_name(),
                         }) as Arc<dyn TableProvider>));
                     };
+                    // The Paimon arm below applies these; an engine would
+                    // ignore them and answer from current data. A missing
+                    // engine only exposes catalog metadata, so read-specific
+                    // session options do not apply to that fallback.
+                    let session_options = dynamic_options
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    paimon::spec::CoreOptions::new(&session_options)
+                        .ensure_engine_can_serve(&identifier.full_name())
+                        .map_err(to_datafusion_error)?;
                     let resolved = resolver
                         .resolve_table(&EngineTableRequest::new(
                             identifier.database().to_string(),
@@ -940,7 +942,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                                     true
                                 }
                             },
-                            None => false,
+                            // `table()` returns a metadata-only provider in this
+                            // case, so the SchemaProvider existence contract
+                            // requires the same answer here.
+                            None => true,
                         }
                     }
                     Ok(paimon::catalog::LoadedTable::Paimon(table)) => {

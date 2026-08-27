@@ -923,6 +923,18 @@ async fn unregistered_external_table_does_not_break_information_schema_columns()
     ))
     .await
     .unwrap();
+    ctx.sql("SET 'paimon.scan.version' = '1'").await.unwrap();
+
+    let provider = ctx.ctx().catalog(CATALOG).unwrap();
+    let schema = provider.schema(DB).unwrap();
+    assert!(
+        schema.table("external").await.unwrap().is_some(),
+        "metadata-only table loading should succeed without a registered engine"
+    );
+    assert!(
+        schema.table_exist("external"),
+        "table_exist must agree with the metadata-only table provider"
+    );
 
     let show_tables = ctx
         .sql("SHOW TABLES")
