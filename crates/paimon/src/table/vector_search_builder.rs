@@ -1351,7 +1351,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 return Ok(vec![SearchResult::empty(); vector_searches.len()]);
             }
             for search in &mut vector_searches {
-                search.include_row_ids = Some(Arc::clone(include_row_ids));
+                search.set_shared_include_row_ids(Arc::clone(include_row_ids));
             }
         } else if let Some(filter) = &self.filter {
             let include_row_ids = matching_row_ids_for_filter(&pinned_table, filter).await?;
@@ -1360,7 +1360,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             }
             let include_row_ids = Arc::new(include_row_ids);
             for search in &mut vector_searches {
-                search.include_row_ids = Some(Arc::clone(&include_row_ids));
+                search.set_shared_include_row_ids(Arc::clone(&include_row_ids));
             }
         }
 
@@ -1760,12 +1760,11 @@ async fn evaluate_batch_vector_search(
     let vector_entry_count = vector_entries.len();
     let shared_include_row_ids =
         vector_searches[0]
-            .include_row_ids
-            .as_ref()
+            .effective_include_row_ids()
             .filter(|include_row_ids| {
                 vector_searches
                     .iter()
-                    .all(|search| search.include_row_ids.as_ref() == Some(*include_row_ids))
+                    .all(|search| search.effective_include_row_ids() == Some(*include_row_ids))
             });
     let vector_search_plans = if let Some(include_row_ids) = shared_include_row_ids {
         let ranges = vector_entries
@@ -1861,24 +1860,27 @@ async fn evaluate_batch_vector_search(
                     if let Some(local_filter) = shared_local_filter {
                         let local_filter = Arc::new(local_filter);
                         for vector_search in &mut vector_searches {
-                            vector_search.include_row_ids = Some(Arc::clone(&local_filter));
+                            vector_search
+                                .set_shared_include_row_ids(Arc::clone(&local_filter));
                         }
                     } else {
                         for vector_search in &mut vector_searches {
-                            if let Some(include_row_ids) = vector_search.include_row_ids.as_ref() {
-                                vector_search.include_row_ids =
-                                    Some(Arc::new(localize_include_row_ids(
+                            if let Some(include_row_ids) =
+                                vector_search.effective_include_row_ids()
+                            {
+                                vector_search.set_shared_include_row_ids(Arc::new(
+                                    localize_include_row_ids(
                                         include_row_ids,
                                         row_range_start,
                                         row_range_end,
-                                    )?));
+                                    )?,
+                                ));
                             }
                         }
                     }
                     if vector_searches.iter().all(|search| {
                         search
-                            .include_row_ids
-                            .as_ref()
+                            .effective_include_row_ids()
                             .is_some_and(|row_ids| row_ids.is_empty())
                     }) {
                         return Ok((
@@ -2759,7 +2761,7 @@ async fn maybe_rerank_indexed_batch_results(
         }
 
         let mut candidate_search = vector_search.clone();
-        candidate_search.include_row_ids = Some(Arc::new(include_row_ids));
+        candidate_search.set_shared_include_row_ids(Arc::new(include_row_ids));
         candidate_searches.push(candidate_search);
         candidate_results.push(candidates);
     }
@@ -3300,7 +3302,7 @@ impl RawScoringPlan {
             .collect();
 
         for (query_index, vector_search) in vector_searches.iter().enumerate() {
-            if let Some(include_row_ids) = &vector_search.include_row_ids {
+            if let Some(include_row_ids) = vector_search.effective_include_row_ids() {
                 for row_id in include_row_ids.iter() {
                     candidate_query_indices
                         .entry(row_id)

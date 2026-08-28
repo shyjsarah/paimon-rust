@@ -311,9 +311,9 @@ fn search_lumina(
         return Ok(None);
     }
 
-    let include_row_ids = &vector_search.include_row_ids;
+    let include_row_ids = vector_search.effective_include_row_ids();
 
-    let (distances, labels) = if let Some(ref include_ids) = include_row_ids {
+    let (distances, labels) = if let Some(include_ids) = include_row_ids {
         let filter_id_list: Vec<u64> = include_ids.iter().collect();
         if filter_id_list.is_empty() {
             return Ok(None);
@@ -369,7 +369,7 @@ fn search_lumina_batch(
     }
     if vector_searches
         .iter()
-        .any(|vector_search| vector_search.include_row_ids.is_some())
+        .any(|vector_search| vector_search.effective_include_row_ids().is_some())
     {
         return vector_searches
             .iter()

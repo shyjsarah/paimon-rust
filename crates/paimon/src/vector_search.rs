@@ -25,7 +25,8 @@ pub struct VectorSearch {
     pub limit: usize,
     pub field_name: String,
     pub options: HashMap<String, String>,
-    pub include_row_ids: Option<Arc<roaring::RoaringTreemap>>,
+    pub include_row_ids: Option<roaring::RoaringTreemap>,
+    pub(crate) shared_include_row_ids: Option<Arc<roaring::RoaringTreemap>>,
 }
 
 impl VectorSearch {
@@ -54,6 +55,7 @@ impl VectorSearch {
             field_name,
             options: HashMap::new(),
             include_row_ids: None,
+            shared_include_row_ids: None,
         })
     }
 
@@ -63,8 +65,23 @@ impl VectorSearch {
     }
 
     pub fn with_include_row_ids(mut self, include_row_ids: roaring::RoaringTreemap) -> Self {
-        self.include_row_ids = Some(Arc::new(include_row_ids));
+        self.include_row_ids = Some(include_row_ids);
+        self.shared_include_row_ids = None;
         self
+    }
+
+    pub(crate) fn set_shared_include_row_ids(
+        &mut self,
+        include_row_ids: Arc<roaring::RoaringTreemap>,
+    ) {
+        self.include_row_ids = None;
+        self.shared_include_row_ids = Some(include_row_ids);
+    }
+
+    pub(crate) fn effective_include_row_ids(&self) -> Option<&roaring::RoaringTreemap> {
+        self.shared_include_row_ids
+            .as_deref()
+            .or(self.include_row_ids.as_ref())
     }
 }
 
@@ -336,7 +353,7 @@ mod tests {
         assert_eq!(cloned.limit, vector_search.limit);
         assert_eq!(cloned.field_name, vector_search.field_name);
         assert_eq!(cloned.options, vector_search.options);
-        assert_eq!(cloned.include_row_ids.as_deref(), Some(&include_row_ids));
+        assert_eq!(cloned.include_row_ids.as_ref(), Some(&include_row_ids));
     }
 
     #[test]

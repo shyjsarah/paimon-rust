@@ -472,7 +472,7 @@ fn prepare_search(
         ),
     };
 
-    let filter_bytes = if let Some(include_ids) = &vector_search.include_row_ids {
+    let filter_bytes = if let Some(include_ids) = vector_search.effective_include_row_ids() {
         if include_ids.is_empty() {
             return Ok(None);
         }
