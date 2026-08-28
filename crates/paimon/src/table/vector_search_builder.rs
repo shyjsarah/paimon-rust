@@ -414,8 +414,8 @@ impl<'a> VectorSearchBuilder<'a> {
     /// subsequent row-range read materializes those rows, and each row's score is
     /// joined back by `_ROW_ID`. Output columns are the projected user table
     /// columns (all user columns by default) plus `__paimon_search_score`; `_ROW_ID`
-    /// is always hidden. A filter is unsupported here and fails loud inside
-    /// `execute_scored`.
+    /// is always hidden. A scalar filter is applied before vector Top-K by the
+    /// snapshot-pinned scored search below.
     async fn execute_de_vector_read(
         &self,
         vector_column: &str,
