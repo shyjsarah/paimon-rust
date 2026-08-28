@@ -37,7 +37,10 @@ use datafusion::common::{
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::{QueryPlanner, SessionState};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan, TableScan, UserDefinedLogicalNode};
+use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+use datafusion::logical_expr::{
+    Expr, Extension, Filter, LogicalPlan, Projection, TableScan, UserDefinedLogicalNode,
+};
 use datafusion::optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -49,11 +52,13 @@ use datafusion::physical_plan::{
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionConfig;
 use futures::{StreamExt, TryStreamExt};
-use paimon::spec::ROW_ID_FIELD_NAME;
-use paimon::table::{RowRange, Table};
+use paimon::spec::{Predicate, ROW_ID_FIELD_NAME};
+use paimon::table::{PreparedVectorSearchFilter, RowRange, Table};
 use paimon::vector_search::SearchResult;
+use tokio::sync::OnceCell;
 
 use crate::error::to_datafusion_error;
+use crate::filter_pushdown::{analyze_filters, is_safe_vector_prefilter};
 use crate::vector_search::LateralVectorSearchTableProvider;
 
 #[derive(Debug)]
@@ -114,6 +119,84 @@ impl OptimizerRule for RewriteLateralVectorSearch {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DFResult<Transformed<LogicalPlan>> {
+        if let LogicalPlan::Filter(filter) = plan {
+            let (extension, projection) = match filter.input.as_ref() {
+                LogicalPlan::Extension(extension) => (extension, None),
+                LogicalPlan::Projection(projection)
+                    if projection
+                        .expr
+                        .iter()
+                        .all(|expr| matches!(expr, Expr::Column(_))) =>
+                {
+                    let LogicalPlan::Extension(extension) = projection.input.as_ref() else {
+                        return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+                    };
+                    (extension, Some(projection))
+                }
+                _ => return Ok(Transformed::no(LogicalPlan::Filter(filter))),
+            };
+            let Some(node) = extension
+                .node
+                .as_any()
+                .downcast_ref::<LateralVectorSearchNode>()
+            else {
+                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+            };
+            let mut target_predicates = Vec::new();
+            let mut residual_predicates = Vec::new();
+            for conjunct in split_conjunction(&filter.predicate) {
+                if conjunct
+                    .column_refs()
+                    .iter()
+                    .any(|column| node.input.schema().index_of_column(column).is_ok())
+                {
+                    residual_predicates.push(conjunct.clone());
+                    continue;
+                }
+                let analysis = analyze_filters(
+                    std::slice::from_ref(conjunct),
+                    node.target_table.schema().fields(),
+                    true,
+                );
+                match analysis.pushed_predicate {
+                    Some(predicate)
+                        if !analysis.requires_residual && is_safe_vector_prefilter(&predicate) =>
+                    {
+                        target_predicates.push(predicate);
+                    }
+                    _ => {
+                        residual_predicates.push(conjunct.clone());
+                    }
+                }
+            }
+            if target_predicates.is_empty() {
+                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+            }
+            let predicate = Predicate::and(target_predicates);
+            let predicate = match &node.filter {
+                Some(existing) => Predicate::and(vec![existing.clone(), predicate]),
+                None => predicate,
+            };
+            let extension = LogicalPlan::Extension(Extension {
+                node: Arc::new(node.with_filter(predicate)),
+            });
+            let rewritten = match projection {
+                Some(projection) => LogicalPlan::Projection(Projection::try_new_with_schema(
+                    projection.expr.clone(),
+                    Arc::new(extension),
+                    Arc::clone(&projection.schema),
+                )?),
+                None => extension,
+            };
+            let rewritten = match conjunction(residual_predicates) {
+                Some(predicate) => {
+                    LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(rewritten))?)
+                }
+                None => rewritten,
+            };
+            return Ok(Transformed::yes(rewritten));
+        }
+
         let LogicalPlan::Join(join) = plan else {
             return Ok(Transformed::no(plan));
         };
@@ -181,6 +264,7 @@ pub(crate) struct LateralVectorSearchNode {
     query_vector_expr: Expr,
     limit: usize,
     schema: DFSchemaRef,
+    filter: Option<Predicate>,
 }
 
 impl LateralVectorSearchNode {
@@ -201,7 +285,14 @@ impl LateralVectorSearchNode {
             query_vector_expr,
             limit,
             schema,
+            filter: None,
         }
+    }
+
+    fn with_filter(&self, filter: Predicate) -> Self {
+        let mut node = self.clone();
+        node.filter = Some(filter);
+        node
     }
 
     fn target_table(&self) -> &Table {
@@ -253,8 +344,8 @@ impl UserDefinedLogicalNode for LateralVectorSearchNode {
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "LateralVectorSearch: column={}, limit={}",
-            self.target_column, self.limit
+            "LateralVectorSearch: column={}, limit={}, filter={:?}",
+            self.target_column, self.limit, self.filter
         )
     }
 
@@ -274,6 +365,7 @@ impl UserDefinedLogicalNode for LateralVectorSearchNode {
             query_vector_expr: exprs.into_iter().next().unwrap(),
             limit: self.limit,
             schema: Arc::clone(&self.schema),
+            filter: self.filter.clone(),
         }))
     }
 
@@ -284,6 +376,7 @@ impl UserDefinedLogicalNode for LateralVectorSearchNode {
         self.target_column.hash(&mut state);
         self.query_vector_expr.hash(&mut state);
         self.limit.hash(&mut state);
+        format!("{:?}", self.filter).hash(&mut state);
     }
 
     fn dyn_eq(&self, other: &dyn UserDefinedLogicalNode) -> bool {
@@ -293,6 +386,7 @@ impl UserDefinedLogicalNode for LateralVectorSearchNode {
                 && self.target_column == other.target_column
                 && self.query_vector_expr == other.query_vector_expr
                 && self.limit == other.limit
+                && self.filter == other.filter
         })
     }
 
@@ -331,7 +425,7 @@ impl ExtensionPlanner for LateralVectorSearchExtensionPlanner {
             logical_inputs[0].schema(),
             session_state,
         )?;
-        Ok(Some(Arc::new(LateralVectorSearchExec::new(
+        let mut exec = LateralVectorSearchExec::new(
             Arc::clone(&physical_inputs[0]),
             node.target_table().clone(),
             Arc::clone(node.target_schema()),
@@ -339,7 +433,11 @@ impl ExtensionPlanner for LateralVectorSearchExtensionPlanner {
             query_vector_expr,
             node.limit(),
             Arc::new(node.schema().as_arrow().clone()),
-        ))))
+        );
+        if let Some(filter) = &node.filter {
+            exec = exec.with_filter(filter.clone());
+        }
+        Ok(Some(Arc::new(exec)))
     }
 }
 
@@ -352,6 +450,8 @@ struct LateralVectorSearchExec {
     query_vector_expr: Arc<dyn PhysicalExpr>,
     limit: usize,
     output_schema: ArrowSchemaRef,
+    filter: Option<Predicate>,
+    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
     plan_properties: Arc<PlanProperties>,
 }
 
@@ -380,8 +480,15 @@ impl LateralVectorSearchExec {
             query_vector_expr,
             limit,
             output_schema,
+            filter: None,
+            prepared_filter: Arc::new(OnceCell::new()),
             plan_properties,
         }
+    }
+
+    fn with_filter(mut self, filter: Predicate) -> Self {
+        self.filter = Some(filter);
+        self
     }
 
     async fn process_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
@@ -398,17 +505,35 @@ impl LateralVectorSearchExec {
             return empty_batch(self.output_schema.clone());
         }
 
-        let mut builder = self.target_table.new_batch_vector_search_builder();
-        let results = builder
+        let (target_table, include_row_ids) = match &self.filter {
+            Some(filter) => {
+                let prepared = self
+                    .prepared_filter
+                    .get_or_try_init(|| {
+                        self.target_table
+                            .prepare_vector_search_filter(filter.clone())
+                    })
+                    .await
+                    .map_err(to_datafusion_error)?;
+                (
+                    prepared.table(),
+                    Some(Arc::clone(prepared.include_row_ids())),
+                )
+            }
+            None => (&self.target_table, None),
+        };
+        let mut builder = target_table.new_batch_vector_search_builder();
+        builder
             .with_vector_column(&self.target_column)
             .with_query_vectors(query_vectors)
-            .with_limit(self.limit)
-            .execute()
-            .await
-            .map_err(to_datafusion_error)?;
+            .with_limit(self.limit);
+        if let Some(include_row_ids) = include_row_ids {
+            builder.with_shared_include_row_ids(include_row_ids);
+        }
+        let results = builder.execute().await.map_err(to_datafusion_error)?;
 
         let (target_batch, target_row_id_to_index) =
-            read_target_rows(&self.target_table, &self.target_schema, &results).await?;
+            read_target_rows(target_table, &self.target_schema, &results).await?;
 
         let mut left_indices = Vec::new();
         let mut right_indices = Vec::new();
@@ -452,8 +577,8 @@ impl DisplayAs for LateralVectorSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "LateralVectorSearchExec: column={}, limit={}",
-            self.target_column, self.limit
+            "LateralVectorSearchExec: column={}, limit={}, filter={:?}",
+            self.target_column, self.limit, self.filter
         )
     }
 }
@@ -478,7 +603,7 @@ impl ExecutionPlan for LateralVectorSearchExec {
         if children.len() != 1 {
             return internal_err!("LateralVectorSearchExec expects one child");
         }
-        Ok(Arc::new(Self::new(
+        let mut exec = Self::new(
             children.remove(0),
             self.target_table.clone(),
             Arc::clone(&self.target_schema),
@@ -486,7 +611,12 @@ impl ExecutionPlan for LateralVectorSearchExec {
             Arc::clone(&self.query_vector_expr),
             self.limit,
             Arc::clone(&self.output_schema),
-        )))
+        );
+        if let Some(filter) = &self.filter {
+            exec = exec.with_filter(filter.clone());
+        }
+        exec.prepared_filter = Arc::clone(&self.prepared_filter);
+        Ok(Arc::new(exec))
     }
 
     fn execute(
