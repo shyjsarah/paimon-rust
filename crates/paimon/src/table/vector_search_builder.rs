@@ -196,6 +196,27 @@ pub struct BatchVectorSearchBuilder<'a> {
     options: HashMap<String, String>,
     projection: Option<Vec<String>>,
     filter: Option<Predicate>,
+    include_row_ids: Option<Arc<RoaringTreemap>>,
+}
+
+/// A scalar vector pre-filter resolved once against one pinned snapshot.
+///
+/// Reusing this value avoids repeating the same scalar-index/table read for
+/// every input batch of a lateral vector query.
+#[derive(Debug, Clone)]
+pub struct PreparedVectorSearchFilter {
+    table: Table,
+    include_row_ids: Arc<RoaringTreemap>,
+}
+
+impl PreparedVectorSearchFilter {
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    pub fn include_row_ids(&self) -> &Arc<RoaringTreemap> {
+        &self.include_row_ids
+    }
 }
 
 /// The primary-key vector route's search output plus the source context a later
@@ -249,16 +270,14 @@ impl<'a> VectorSearchBuilder<'a> {
         self
     }
 
-    /// Attach a residual scalar predicate applied *after* vector recall on the
-    /// primary-key vector path: each recalled candidate file is re-read and only
-    /// rows satisfying `filter` survive, folded into the search so best-first
-    /// order and Top-K still hold. Mirrors Java `PrimaryKeyVectorRead`'s
-    /// residual-filter support. Only the primary-key vector path consumes it, and
-    /// only when the table exposes physical rows directly (deletion vectors
-    /// enabled without merge-on-read); otherwise the query fails loud. A query
-    /// that does not resolve to the primary-key vector path (no PK-vector index,
-    /// or a non-PK-vector column) also fails loud rather than silently ignoring
-    /// the filter.
+    /// Attach a scalar predicate applied before vector Top-K.
+    ///
+    /// On the primary-key vector path this remains a residual allow-list over
+    /// physical positions, mirroring Java `PrimaryKeyVectorRead`. On the
+    /// data-evolution/global-index path the predicate is evaluated through a
+    /// snapshot-pinned table read (which can use scalar global indexes such as
+    /// BTree), producing global row IDs that are localized for each vector-index
+    /// shard and passed to the vector backend as an include filter.
     ///
     /// The whole predicate is both pushed into the scan — where it prunes whole
     /// data files by their column stats — and applied per row as a residual over
@@ -325,27 +344,16 @@ impl<'a> VectorSearchBuilder<'a> {
             }
         }
 
-        // The data-evolution (global-index) fall-through path cannot honor a
-        // residual filter — it never reads physical rows. Rather than silently
-        // drop the predicate and return unfiltered results, fail loud when a
-        // filter is set on a query that does not resolve to the primary-key
-        // vector path.
-        if self.filter.is_some() {
-            return Err(crate::Error::DataInvalid {
-                message: "vector search filter is only supported on the primary-key vector path"
-                    .to_string(),
-                source: None,
-            });
-        }
-
         let mut batch_builder = BatchVectorSearchBuilder::new(self.table);
-        let mut results = batch_builder
+        batch_builder
             .with_vector_column(vector_column)
             .with_query_vectors(vec![query_vector.clone()])
             .with_limit(limit)
-            .with_options(self.options.clone())
-            .execute()
-            .await?;
+            .with_options(self.options.clone());
+        if let Some(filter) = &self.filter {
+            batch_builder.with_filter(filter.clone());
+        }
+        let mut results = batch_builder.execute().await?;
 
         debug_assert_eq!(results.len(), 1);
         Ok(results.remove(0))
@@ -397,7 +405,8 @@ impl<'a> VectorSearchBuilder<'a> {
         // Data-evolution (global-index) vector search: materialize rows from the
         // scored global row-ids and attach the unified score column. A non-vector
         // column or a set filter fails loud inside execute_scored below.
-        self.execute_de_vector_read().await
+        self.execute_de_vector_read(vector_column, query_vector, limit)
+            .await
     }
 
     /// Materialize the best-first data-evolution vector search hits into Arrow
@@ -407,19 +416,18 @@ impl<'a> VectorSearchBuilder<'a> {
     /// columns (all user columns by default) plus `__paimon_search_score`; `_ROW_ID`
     /// is always hidden. A filter is unsupported here and fails loud inside
     /// `execute_scored`.
-    async fn execute_de_vector_read(&self) -> crate::Result<ArrowRecordBatchStream> {
+    async fn execute_de_vector_read(
+        &self,
+        vector_column: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         // Validate the target column exists and is a vector-bearing type before any
         // work. The data-evolution search returns an empty result for an unknown
         // field (its scored-path behavior), which would make a typo'd or scalar
         // column look like a normal empty read here — violating `execute_read`'s
         // fail-loud contract (a C/Doris caller would see EOF, not an input error).
         // Reject it up front instead.
-        let vector_column =
-            self.vector_column
-                .as_deref()
-                .ok_or_else(|| crate::Error::ConfigInvalid {
-                    message: "Vector column must be set via with_vector_column()".to_string(),
-                })?;
         let field = self
             .table
             .schema()
@@ -449,11 +457,24 @@ impl<'a> VectorSearchBuilder<'a> {
             });
         }
 
-        let sr = self.execute_scored().await?;
-
         // Resolve the projected user columns up front so an invalid projection
         // fails loud even when the result is empty.
         let mut read_type = self.resolve_materialize_read_type()?;
+
+        let Some(snapshot) = crate::table::time_travel::resolve_snapshot(self.table).await? else {
+            return Ok(Box::pin(stream::empty()));
+        };
+        let pinned_table = self.table.copy_with_resolved_snapshot(&snapshot).await?;
+        let mut search_builder = pinned_table.new_vector_search_builder();
+        search_builder
+            .with_vector_column(vector_column)
+            .with_query_vector(query_vector.to_vec())
+            .with_limit(limit)
+            .with_options(self.options.clone());
+        if let Some(filter) = &self.filter {
+            search_builder.with_filter(filter.clone());
+        }
+        let sr = search_builder.execute_scored().await?;
 
         if sr.is_empty() {
             return Ok(Box::pin(stream::empty()));
@@ -472,7 +493,7 @@ impl<'a> VectorSearchBuilder<'a> {
             read_type.push(row_id_data_field());
         }
 
-        let mut read_builder = self.table.new_read_builder();
+        let mut read_builder = pinned_table.new_read_builder();
         read_builder
             .with_read_type(read_type)
             .with_row_ranges(ranges);
@@ -1171,6 +1192,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             options: HashMap::new(),
             projection: None,
             filter: None,
+            include_row_ids: None,
         }
     }
 
@@ -1194,14 +1216,32 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         self
     }
 
-    /// Attach a residual scalar predicate applied *after* vector recall on the
-    /// primary-key vector path, shared across every query in the batch. Mirrors
-    /// the single [`VectorSearchBuilder::with_filter`]: only the primary-key
-    /// vector path (via [`execute_read`](Self::execute_read)) consumes it, and only
-    /// when the table exposes physical rows directly (deletion vectors without
-    /// merge-on-read); otherwise the query fails loud.
+    /// Attach one scalar predicate shared by every query in the batch and applied
+    /// before vector Top-K. See [`VectorSearchBuilder::with_filter`] for the
+    /// primary-key and data-evolution execution semantics.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = Some(filter);
+        self.include_row_ids = None;
+        self
+    }
+
+    /// Reuse row IDs from a previously prepared scalar pre-filter.
+    ///
+    /// The builder's table must be [`PreparedVectorSearchFilter::table`] (or an
+    /// equivalent copy pinned to the same snapshot).
+    pub fn with_include_row_ids(&mut self, include_row_ids: RoaringTreemap) -> &mut Self {
+        self.include_row_ids = Some(Arc::new(include_row_ids));
+        self.filter = None;
+        self
+    }
+
+    /// Reuse a shared row-ID allow-list without copying its bitmap.
+    pub fn with_shared_include_row_ids(
+        &mut self,
+        include_row_ids: Arc<RoaringTreemap>,
+    ) -> &mut Self {
+        self.include_row_ids = Some(include_row_ids);
+        self.filter = None;
         self
     }
 
@@ -1270,20 +1310,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             }
         }
 
-        // The data-evolution (global-index) fall-through path cannot honor a
-        // residual filter — it never reads physical rows. Rather than silently
-        // drop the predicate and return unfiltered results, fail loud when a
-        // filter is set on a batch that does not resolve to the primary-key
-        // vector path, mirroring the single-query builder.
-        if self.filter.is_some() {
-            return Err(crate::Error::DataInvalid {
-                message: "vector search filter is only supported on the primary-key vector path"
-                    .to_string(),
-                source: None,
-            });
-        }
-
-        let vector_searches = query_vectors
+        let mut vector_searches = query_vectors
             .iter()
             .map(|vector| {
                 VectorSearch::new(vector.clone(), limit, vector_column.to_string())
@@ -1317,6 +1344,25 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             }
         };
         let snapshot_elapsed = snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let pinned_table = self.table.copy_with_resolved_snapshot(&snapshot).await?;
+
+        if let Some(include_row_ids) = &self.include_row_ids {
+            if include_row_ids.is_empty() {
+                return Ok(vec![SearchResult::empty(); vector_searches.len()]);
+            }
+            for search in &mut vector_searches {
+                search.include_row_ids = Some(Arc::clone(include_row_ids));
+            }
+        } else if let Some(filter) = &self.filter {
+            let include_row_ids = matching_row_ids_for_filter(&pinned_table, filter).await?;
+            if include_row_ids.is_empty() {
+                return Ok(vec![SearchResult::empty(); vector_searches.len()]);
+            }
+            let include_row_ids = Arc::new(include_row_ids);
+            for search in &mut vector_searches {
+                search.include_row_ids = Some(Arc::clone(&include_row_ids));
+            }
+        }
 
         let manifest_start = timing_enabled.then(Instant::now);
         let index_entries = match snapshot.index_manifest() {
@@ -1331,11 +1377,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         let evaluate_start = timing_enabled.then(Instant::now);
         let results = evaluate_batch_vector_search(
             VectorSearchEvaluation {
-                table: Some(self.table),
-                file_io: self.table.file_io(),
-                table_path: self.table.location(),
-                table_options: self.table.schema().options(),
-                schema_fields: self.table.schema().fields(),
+                table: Some(&pinned_table),
+                file_io: pinned_table.file_io(),
+                table_path: pinned_table.location(),
+                table_options: pinned_table.schema().options(),
+                schema_fields: pinned_table.schema().fields(),
                 next_row_id: snapshot.next_row_id(),
             },
             &index_entries,
@@ -1522,6 +1568,84 @@ struct VectorSearchEvaluation<'a> {
     next_row_id: Option<i64>,
 }
 
+async fn matching_row_ids_for_filter(
+    table: &Table,
+    filter: &Predicate,
+) -> crate::Result<RoaringTreemap> {
+    let mut read_builder = table.new_read_builder();
+    read_builder
+        .with_projection(&[ROW_ID_FIELD_NAME])?
+        .with_filter(filter.clone());
+    let plan = read_builder.new_scan().plan().await?;
+    let read = read_builder.new_read()?;
+    let mut stream = read.to_arrow(plan.splits())?;
+    let mut row_ids = RoaringTreemap::new();
+    while let Some(batch) = stream.try_next().await? {
+        let index =
+            batch
+                .schema()
+                .index_of(ROW_ID_FIELD_NAME)
+                .map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "scalar vector pre-filter read is missing {ROW_ID_FIELD_NAME}"
+                    ),
+                    source: None,
+                })?;
+        let values = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "scalar vector pre-filter {ROW_ID_FIELD_NAME} column is not Int64"
+                ),
+                source: None,
+            })?;
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "scalar vector pre-filter produced a null {ROW_ID_FIELD_NAME}"
+                    ),
+                    source: None,
+                });
+            }
+            let row_id = values.value(row);
+            let row_id = u64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+                message: format!(
+                    "scalar vector pre-filter produced a negative {ROW_ID_FIELD_NAME}: {row_id}"
+                ),
+                source: None,
+            })?;
+            row_ids.insert(row_id);
+        }
+    }
+    Ok(row_ids)
+}
+
+impl Table {
+    /// Resolve a scalar predicate once and pin all later vector-search/read
+    /// stages to the same snapshot.
+    pub async fn prepare_vector_search_filter(
+        &self,
+        filter: Predicate,
+    ) -> crate::Result<PreparedVectorSearchFilter> {
+        CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
+        let Some(snapshot) = crate::table::time_travel::resolve_snapshot(self).await? else {
+            return Ok(PreparedVectorSearchFilter {
+                table: self.clone(),
+                include_row_ids: Arc::new(RoaringTreemap::new()),
+            });
+        };
+        let table = self.copy_with_resolved_snapshot(&snapshot).await?;
+        let include_row_ids = matching_row_ids_for_filter(&table, &filter).await?;
+        Ok(PreparedVectorSearchFilter {
+            table,
+            include_row_ids: Arc::new(include_row_ids),
+        })
+    }
+}
+
 #[derive(Default)]
 struct IndexSearchTiming {
     permit_wait: Duration,
@@ -1634,6 +1758,44 @@ async fn evaluate_batch_vector_search(
     let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
 
     let vector_entry_count = vector_entries.len();
+    let shared_include_row_ids =
+        vector_searches[0]
+            .include_row_ids
+            .as_ref()
+            .filter(|include_row_ids| {
+                vector_searches
+                    .iter()
+                    .all(|search| search.include_row_ids.as_ref() == Some(*include_row_ids))
+            });
+    let vector_search_plans = if let Some(include_row_ids) = shared_include_row_ids {
+        let ranges = vector_entries
+            .iter()
+            .map(|entry| {
+                let meta = entry.index_file.global_index_meta.as_ref().ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: format!(
+                            "Vector index '{}' is missing global index metadata",
+                            entry.index_file.file_name
+                        ),
+                        source: None,
+                    }
+                })?;
+                Ok((meta.row_range_start, meta.row_range_end))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        vector_entries
+            .iter()
+            .copied()
+            .zip(localize_shared_include_row_ids(include_row_ids, &ranges)?)
+            .filter_map(|(entry, local_filter)| local_filter.map(|filter| (entry, Some(filter))))
+            .collect::<Vec<_>>()
+    } else {
+        vector_entries
+            .iter()
+            .copied()
+            .map(|entry| (entry, None))
+            .collect::<Vec<_>>()
+    };
     let mut permit_wait = Duration::ZERO;
     let mut file_reader_open = Duration::ZERO;
     let mut index_search = Duration::ZERO;
@@ -1668,9 +1830,9 @@ async fn evaluate_batch_vector_search(
                 Some(RangeReadLimiter::new(range_read_concurrency)),
             )
         };
-        let futures: Vec<_> = vector_entries
+        let futures: Vec<_> = vector_search_plans
             .into_iter()
-            .map(|entry| {
+            .map(|(entry, shared_local_filter)| {
                 let range_read_limiter = range_read_limiter.clone();
                 let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
                 let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
@@ -1696,6 +1858,34 @@ async fn evaluate_batch_vector_search(
                 options.extend(search_options.clone());
                 let input = evaluation.file_io.new_input(&path);
                 async move {
+                    if let Some(local_filter) = shared_local_filter {
+                        let local_filter = Arc::new(local_filter);
+                        for vector_search in &mut vector_searches {
+                            vector_search.include_row_ids = Some(Arc::clone(&local_filter));
+                        }
+                    } else {
+                        for vector_search in &mut vector_searches {
+                            if let Some(include_row_ids) = vector_search.include_row_ids.as_ref() {
+                                vector_search.include_row_ids =
+                                    Some(Arc::new(localize_include_row_ids(
+                                        include_row_ids,
+                                        row_range_start,
+                                        row_range_end,
+                                    )?));
+                            }
+                        }
+                    }
+                    if vector_searches.iter().all(|search| {
+                        search
+                            .include_row_ids
+                            .as_ref()
+                            .is_some_and(|row_ids| row_ids.is_empty())
+                    }) {
+                        return Ok((
+                            vec![SearchResult::empty(); vector_searches.len()],
+                            IndexSearchTiming::default(),
+                        ));
+                    }
                     let permit_start = timing_enabled.then(Instant::now);
                     let permit = acquire_process_global_search_permit(concurrency).await?;
                     let permit_wait =
@@ -2569,7 +2759,7 @@ async fn maybe_rerank_indexed_batch_results(
         }
 
         let mut candidate_search = vector_search.clone();
-        candidate_search.include_row_ids = Some(include_row_ids);
+        candidate_search.include_row_ids = Some(Arc::new(include_row_ids));
         candidate_searches.push(candidate_search);
         candidate_results.push(candidates);
     }
@@ -2651,6 +2841,70 @@ fn row_id_to_i64_for_range(row_id: u64) -> crate::Result<i64> {
         ),
         source: None,
     })
+}
+
+fn localize_include_row_ids(
+    include_row_ids: &RoaringTreemap,
+    row_range_start: i64,
+    row_range_end: i64,
+) -> crate::Result<RoaringTreemap> {
+    let start = u64::try_from(row_range_start).map_err(|_| crate::Error::DataInvalid {
+        message: format!("Negative vector index row range start: {row_range_start}"),
+        source: None,
+    })?;
+    let end = u64::try_from(row_range_end).map_err(|_| crate::Error::DataInvalid {
+        message: format!("Negative vector index row range end: {row_range_end}"),
+        source: None,
+    })?;
+    let mut localized = RoaringTreemap::new();
+    for row_id in include_row_ids.iter() {
+        if row_id >= start && row_id <= end {
+            localized.insert(row_id - start);
+        }
+    }
+    Ok(localized)
+}
+
+fn localize_shared_include_row_ids(
+    include_row_ids: &RoaringTreemap,
+    ranges: &[(i64, i64)],
+) -> crate::Result<Vec<Option<RoaringTreemap>>> {
+    let mut validated_ranges = Vec::with_capacity(ranges.len());
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        if start < 0 || end < start {
+            return Err(crate::Error::DataInvalid {
+                message: format!("Invalid vector index row range [{start}, {end}]"),
+                source: None,
+            });
+        }
+        validated_ranges.push((start as u64, end as u64, index));
+    }
+    validated_ranges.sort_unstable_by_key(|(start, _, _)| *start);
+
+    let mut localized = (0..ranges.len())
+        .map(|_| RoaringTreemap::new())
+        .collect::<Vec<_>>();
+    let mut active = Vec::<usize>::new();
+    let mut next_range = 0usize;
+    for row_id in include_row_ids.iter() {
+        while next_range < validated_ranges.len() && validated_ranges[next_range].0 <= row_id {
+            active.push(next_range);
+            next_range += 1;
+        }
+        active.retain(|range_index| validated_ranges[*range_index].1 >= row_id);
+        for range_index in &active {
+            let (start, _, original_index) = validated_ranges[*range_index];
+            localized[original_index].insert(row_id - start);
+        }
+        if next_range == validated_ranges.len() && active.is_empty() {
+            break;
+        }
+    }
+
+    Ok(localized
+        .into_iter()
+        .map(|filter| (!filter.is_empty()).then_some(filter))
+        .collect())
 }
 
 async fn detail_data_ranges_for_table(table: &Table) -> crate::Result<Vec<RowRange>> {
@@ -3745,6 +3999,26 @@ mod tests {
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
         assert_eq!(find_field_id_by_name(&fields, "embedding"), Some(2));
         assert_eq!(find_field_id_by_name(&fields, "nonexistent"), None);
+    }
+
+    #[test]
+    fn shared_include_filter_is_localized_once_per_index_shard() {
+        let include_row_ids = RoaringTreemap::from_iter([101, 205, 999]);
+        let localized = localize_shared_include_row_ids(
+            &include_row_ids,
+            &[(100, 109), (200, 209), (300, 309)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            localized[0].as_ref().unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            localized[1].as_ref().unwrap().iter().collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert!(localized[2].is_none(), "an empty shard must be skipped");
     }
 
     #[test]
@@ -5529,6 +5803,14 @@ mod tests {
             .await
             .unwrap();
         assert!(built > 0, "DE fixture must build a global vector index");
+        let built = table
+            .new_sorted_global_index_build_builder()
+            .with_index_column("id")
+            .with_index_type("btree")
+            .execute()
+            .await
+            .unwrap();
+        assert!(built > 0, "DE fixture must build a scalar BTree index");
         table
     }
 
@@ -6007,14 +6289,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_scored_filter_on_non_pk_vector_path_fails_loud() {
-        // No PK-vector index configured, so `execute_scored` would fall through to
-        // the data-evolution path, which never consumes the filter. Silently
-        // returning unfiltered rows is a wrong-read; the query must fail loud
-        // instead.
+    async fn execute_scored_filter_on_empty_de_path_returns_empty() {
+        // No PK-vector index and no snapshot: the request follows the
+        // data-evolution path. Scalar pre-filter support must not turn an empty
+        // table into an error.
         let table = pk_vector_table(&[]);
         let filter = id_gt_filter(&table, 2);
-        let err = table
+        let result = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
             .with_query_vector(vec![1.0])
@@ -6022,13 +6303,8 @@ mod tests {
             .with_filter(filter)
             .execute_scored()
             .await
-            .map(|_| ())
-            .expect_err("filter on the non-PK-vector path must fail loud");
-        assert!(
-            matches!(err, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("only supported on the primary-key vector path")),
-            "unexpected error: {err:?}"
-        );
+            .expect("an empty data-evolution search with a filter should succeed");
+        assert!(result.is_empty());
     }
 
     #[tokio::test]
@@ -6894,26 +7170,155 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn de_execute_read_with_filter_fails_loud() {
-        // A filter on the data-evolution path is unsupported (the DE path never
-        // reads physical rows), so execute_read must fail loud rather than drop the
-        // predicate. The guard lives in execute_scored.
+    async fn resolved_vector_snapshot_can_be_reused_by_all_read_stages() {
+        let table = de_vector_table().await;
+        let snapshot = crate::table::time_travel::resolve_snapshot(&table)
+            .await
+            .unwrap()
+            .unwrap();
+        let pinned = table.copy_with_resolved_snapshot(&snapshot).await.unwrap();
+
+        assert_eq!(
+            pinned.travel_snapshot().map(|snapshot| snapshot.id()),
+            Some(snapshot.id())
+        );
+        let options = CoreOptions::new(pinned.schema().options());
+        let selector = options.try_time_travel_selector().unwrap().unwrap();
+        assert!(matches!(
+            selector,
+            crate::spec::TimeTravelSelector::SnapshotId {
+                value,
+                option_name: crate::spec::SCAN_SNAPSHOT_ID_OPTION,
+            } if value == snapshot.id().to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn de_execute_read_applies_scalar_filter_before_top_k() {
+        // Row id=1 is the closest vector to [1, 0], but the scalar filter excludes
+        // it. Filter-before-Top-K must return the best rows among ids > 1 instead
+        // of recalling id=1 first and filtering it after the search.
         let table = de_vector_table().await;
         let filter = id_gt_filter(&table, 1);
-        let err = table
+        let mut stream = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
             .with_query_vector(vec![1.0, 0.0])
-            .with_limit(3)
+            .with_limit(2)
             .with_filter(filter)
             .execute_read()
             .await
-            .map(|_| ())
-            .expect_err("DE read with a filter must fail loud");
-        assert!(
-            matches!(err, crate::Error::DataInvalid { .. }),
-            "unexpected error: {err:?}"
-        );
+            .expect("DE vector search should support a scalar pre-filter");
+
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let id = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..id.len()).map(|row| id.value(row)));
+        }
+
+        assert_eq!(ids, vec![3, 2]);
+    }
+
+    #[tokio::test]
+    async fn de_scalar_filter_with_no_matching_rows_returns_empty() {
+        let table = de_vector_table().await;
+        let filter = id_gt_filter(&table, 99);
+
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(2)
+            .with_filter(filter.clone())
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+
+        let results = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .with_limit(2)
+            .with_filter(filter)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(SearchResult::is_empty));
+    }
+
+    #[tokio::test]
+    async fn prepared_de_scalar_filter_can_be_reused_by_batch_search() {
+        let table = de_vector_table().await;
+        let prepared = table
+            .prepare_vector_search_filter(id_gt_filter(&table, 1))
+            .await
+            .unwrap();
+        let results = prepared
+            .table()
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
+            .with_limit(2)
+            .with_shared_include_row_ids(Arc::clone(prepared.include_row_ids()))
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].row_ids, vec![2, 1]);
+        assert_eq!(results[1].row_ids, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn de_scalar_filter_applies_to_unindexed_raw_fallback() {
+        let table = de_vector_table().await;
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vector_builder =
+            ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
+        vector_builder.values().append_value(1.0);
+        vector_builder.values().append_value(0.0);
+        vector_builder.append(true);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("embedding", ArrowDataType::List(element_field), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![4])) as ArrayRef,
+                Arc::new(vector_builder.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let table = table.copy_with_options(HashMap::from([
+            ("vector-index.search-mode".to_string(), "full".to_string()),
+            ("scalar-index.search-mode".to_string(), "full".to_string()),
+        ]));
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(1)
+            .with_filter(id_gt_filter(&table, 3))
+            .execute_scored()
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_ids, vec![3]);
     }
 }
 
