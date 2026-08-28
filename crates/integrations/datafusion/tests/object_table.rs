@@ -100,6 +100,18 @@ async fn object_table_lists_files_recursively() {
         ]
     );
 
+    let count = ctx
+        .sql("SELECT COUNT(*) FROM cat.db.objects")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        array_value_to_string(count[0].column(0).as_ref(), 0).unwrap(),
+        "2"
+    );
+
     let limited = ctx
         .sql("SELECT path FROM cat.db.objects LIMIT 1")
         .await

@@ -22,6 +22,8 @@ use crate::spec::{
     PATH_OPTION,
 };
 use crate::{Error, Result};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 
 /// Metadata for one file exposed by an [`ObjectTable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,54 +205,77 @@ impl ObjectTable {
     /// Recursively list files under the object location, stopping after
     /// `limit` files have been yielded by the storage backend when supplied.
     pub async fn list_objects_with_limit(&self, limit: Option<usize>) -> Result<Vec<ObjectEntry>> {
-        let mut entries = Vec::new();
-        let location_path = normalized_path(&self.location);
-        for status in self
-            .file_io
-            .list_status_recursive_with_limit(&self.location, limit)
+        let mut entries = self
+            .stream_objects(limit)
             .await?
-        {
-            let status_path = normalized_path(&status.path);
-            let relative = status_path
-                .strip_prefix(&location_path)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "Object path '{}' is outside table location '{}'",
-                        status.path, self.location
-                    ),
-                    source: None,
-                })?
-                .trim_start_matches('/')
-                .to_string();
-            let name = relative
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!("Object path '{}' has no file name", status.path),
-                    source: None,
-                })?
-                .to_string();
-            let length = i64::try_from(status.size).map_err(|_| Error::DataInvalid {
-                message: format!("Object '{}' is too large to fit in BIGINT", status.path),
-                source: None,
-            })?;
-            entries.push(ObjectEntry {
-                path: relative,
-                name,
-                length,
-                mtime: status
-                    .last_modified
-                    .map(|modified| modified.timestamp_millis())
-                    .unwrap_or(0),
-                // OpenDAL does not expose these values portably.
-                atime: 0,
-                owner: None,
-            });
-        }
+            .try_collect::<Vec<_>>()
+            .await?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(entries)
     }
+
+    /// Stream files under the object location in storage listing order.
+    pub async fn stream_objects(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<BoxStream<'static, Result<ObjectEntry>>> {
+        let statuses = self
+            .file_io
+            .list_status_recursive_stream(&self.location, limit)
+            .await?;
+        let location = self.location.clone();
+        let location_path = normalized_path(&location);
+        Ok(statuses
+            .map(move |status| {
+                status
+                    .and_then(|status| object_entry_from_status(&location, &location_path, status))
+            })
+            .boxed())
+    }
+}
+
+fn object_entry_from_status(
+    location: &str,
+    location_path: &str,
+    status: crate::io::FileStatus,
+) -> Result<ObjectEntry> {
+    let status_path = normalized_path(&status.path);
+    let relative = status_path
+        .strip_prefix(location_path)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Object path '{}' is outside table location '{}'",
+                status.path, location
+            ),
+            source: None,
+        })?
+        .trim_start_matches('/')
+        .to_string();
+    let name = relative
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!("Object path '{}' has no file name", status.path),
+            source: None,
+        })?
+        .to_string();
+    let length = i64::try_from(status.size).map_err(|_| Error::DataInvalid {
+        message: format!("Object '{}' is too large to fit in BIGINT", status.path),
+        source: None,
+    })?;
+    Ok(ObjectEntry {
+        path: relative,
+        name,
+        length,
+        mtime: status
+            .last_modified
+            .map(|modified| modified.timestamp_millis())
+            .unwrap_or(0),
+        // OpenDAL does not expose these values portably.
+        atime: 0,
+        owner: None,
+    })
 }
 
 fn normalized_path(value: &str) -> String {

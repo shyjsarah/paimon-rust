@@ -26,7 +26,8 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use opendal::raw::normalize_root;
 use opendal::Operator;
 use snafu::ResultExt;
@@ -232,17 +233,28 @@ impl FileIO {
         path: &str,
         limit: Option<usize>,
     ) -> Result<Vec<FileStatus>> {
+        self.list_status_recursive_stream(path, limit)
+            .await?
+            .try_collect()
+            .await
+    }
+
+    pub(crate) async fn list_status_recursive_stream(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<BoxStream<'static, Result<FileStatus>>> {
         if limit == Some(0) {
-            return Ok(Vec::new());
+            return Ok(futures::stream::empty().boxed());
         }
 
         let (op, relative_path) = self.create(path).await?;
         // See `list_status`: `relative_path` is a byte-suffix of `path` except
         // for Windows local paths, where it only swaps separators (same length).
-        let base_path = &path[..path.len() - relative_path.len()];
+        let base_path = path[..path.len() - relative_path.len()].to_string();
         let list_path = normalize_root(relative_path.as_ref());
 
-        let mut entries =
+        let entries =
             op.lister_with(&list_path)
                 .recursive(true)
                 .await
@@ -250,34 +262,36 @@ impl FileIO {
                     message: format!("Failed to list files recursively in '{path}'"),
                 })?;
 
-        let mut statuses = Vec::new();
-        let list_path_normalized = list_path.trim_start_matches('/');
-        while let Some(entry) = entries.try_next().await.context(IoUnexpectedSnafu {
-            message: format!("Failed to list files recursively in '{path}'"),
-        })? {
-            let entry_path = entry.path();
-            if entry_path.trim_start_matches('/') == list_path_normalized {
-                continue;
+        let path = path.to_string();
+        let list_path_normalized = list_path.trim_start_matches('/').to_string();
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut entries = entries;
+            let mut emitted = 0usize;
+            while let Some(entry) = entries.try_next().await.context(IoUnexpectedSnafu {
+                message: format!("Failed to list files recursively in '{path}'"),
+            })? {
+                let entry_path = entry.path();
+                if entry_path.trim_start_matches('/') == list_path_normalized {
+                    continue;
+                }
+                let meta = entry.metadata();
+                if meta.is_dir() {
+                    continue;
+                }
+                yield FileStatus {
+                    size: meta.content_length(),
+                    is_dir: false,
+                    path: status_path(&base_path, entry_path),
+                    last_modified: meta
+                        .last_modified()
+                        .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
+                };
+                emitted += 1;
+                if limit.is_some_and(|limit| emitted >= limit) {
+                    break;
+                }
             }
-            let meta = entry.metadata();
-            if meta.is_dir() {
-                continue;
-            }
-            let status = FileStatus {
-                size: meta.content_length(),
-                is_dir: false,
-                path: status_path(base_path, entry_path),
-                last_modified: meta
-                    .last_modified()
-                    .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
-            };
-            statuses.push(status);
-            if limit.is_some_and(|limit| statuses.len() >= limit) {
-                break;
-            }
-        }
-
-        Ok(statuses)
+        }))
     }
 
     /// Check if exists.
@@ -1102,6 +1116,23 @@ mod file_action_test {
             .unwrap();
 
         assert_eq!(statuses.len(), 1);
+        assert_eq!(pulls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_listing_stream_yields_before_polling_next_entry() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let file_io = setup_memory_file_io().with_provider(Arc::new(CountingListProvider {
+            pulls: Arc::clone(&pulls),
+        }));
+
+        let mut statuses = file_io
+            .list_status_recursive_stream("counting:/objects/", None)
+            .await
+            .unwrap();
+        let first = statuses.try_next().await.unwrap().unwrap();
+
+        assert!(first.path.ends_with("first.txt"));
         assert_eq!(pulls.load(AtomicOrdering::SeqCst), 1);
     }
 
