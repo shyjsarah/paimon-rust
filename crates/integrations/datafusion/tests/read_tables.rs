@@ -1727,7 +1727,7 @@ mod vector_search_tests {
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
-    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema, VarCharType};
     use paimon::table::BranchManager;
@@ -2375,7 +2375,7 @@ mod vector_search_tests {
     }
 
     #[tokio::test]
-    async fn test_lateral_vector_search_reused_plan_refreshes_scalar_prefilter_snapshot() {
+    async fn test_lateral_vector_search_sequential_partitions_share_scalar_prefilter_snapshot() {
         let (ctx, catalog, _tmp) = create_java_vindex_vector_search_context().await;
         ctx.sql(
             "CALL sys.create_global_index( \
@@ -2389,9 +2389,13 @@ mod vector_search_tests {
         .await
         .expect("initial BTree index build should execute");
 
-        let query_batch = build_vector_batch(vec![10], vec![vec![1.0, 0.0, 0.0, 0.0]]);
-        let query_table = MemTable::try_new(query_batch.schema(), vec![vec![query_batch]])
-            .expect("Failed to create query vector table");
+        let first_query_batch = build_vector_batch(vec![10], vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        let second_query_batch = build_vector_batch(vec![20], vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        let query_table = MemTable::try_new(
+            first_query_batch.schema(),
+            vec![vec![first_query_batch], vec![second_query_batch]],
+        )
+        .expect("Failed to create partitioned query vector table");
         ctx.register_temp_table("paimon.default.refresh_queries", Arc::new(query_table))
             .expect("Failed to register query vector table");
 
@@ -2408,10 +2412,20 @@ mod vector_search_tests {
             .create_physical_plan()
             .await
             .expect("physical plan should be created");
+        assert_eq!(
+            physical_plan.output_partitioning().partition_count(),
+            2,
+            "the regression requires sequential execution of two input partitions"
+        );
 
-        let first = collect(Arc::clone(&physical_plan), ctx.ctx().task_ctx())
-            .await
-            .expect("first physical-plan execution should succeed");
+        let task_context = ctx.ctx().task_ctx();
+        let first = datafusion::physical_plan::common::collect(
+            physical_plan
+                .execute(0, Arc::clone(&task_context))
+                .expect("first partition should start"),
+        )
+        .await
+        .expect("first partition should finish");
         assert!(extract_ids_in_order(&first).is_empty());
 
         let identifier = Identifier::new("default", "test_java_vindex_vector");
@@ -2462,13 +2476,30 @@ mod vector_search_tests {
         .await
         .expect("incremental BTree index build should execute");
 
-        let second = collect(physical_plan, ctx.ctx().task_ctx())
-            .await
-            .expect("reused physical-plan execution should succeed");
+        let second = datafusion::physical_plan::common::collect(
+            physical_plan
+                .execute(1, Arc::clone(&task_context))
+                .expect("second partition should start"),
+        )
+        .await
+        .expect("second partition should finish");
+        assert!(
+            extract_ids_in_order(&second).is_empty(),
+            "sequential partitions in one execution must use the same scalar-filter snapshot"
+        );
+
+        drop(task_context);
+        let refreshed = datafusion::physical_plan::common::collect(
+            physical_plan
+                .execute(1, ctx.ctx().task_ctx())
+                .expect("refreshed execution should start"),
+        )
+        .await
+        .expect("refreshed execution should finish");
         assert_eq!(
-            extract_ids_in_order(&second),
+            extract_ids_in_order(&refreshed),
             vec![6],
-            "a reused physical plan must prepare the scalar filter from the new execution snapshot"
+            "a reused physical plan must refresh the scalar filter for a new execution"
         );
     }
 

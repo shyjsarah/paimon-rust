@@ -458,14 +458,15 @@ struct LateralVectorSearchExec {
 #[derive(Debug)]
 struct ExecutionPreparedFilterEntry {
     context: Weak<TaskContext>,
-    prepared_filter: Weak<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
 }
 
 #[derive(Debug, Default)]
 struct ExecutionPreparedFilterCache {
     // DataFusion passes the same TaskContext Arc to every partition of one
-    // execution. Weak references let those partitions share one prepared filter
-    // while ensuring a later execution of the reusable plan starts fresh.
+    // execution. Keep the prepared filter alive for that TaskContext so
+    // sequential partitions resolve the same target snapshot. The weak context
+    // lets a later lookup prune completed executions.
     entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
 }
 
@@ -478,24 +479,20 @@ impl ExecutionPreparedFilterCache {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.retain(|entry| {
-            entry.context.strong_count() > 0 && entry.prepared_filter.strong_count() > 0
-        });
+        entries.retain(|entry| entry.context.strong_count() > 0);
         for entry in entries.iter() {
             let Some(entry_context) = entry.context.upgrade() else {
                 continue;
             };
             if Arc::ptr_eq(&entry_context, context) {
-                if let Some(prepared_filter) = entry.prepared_filter.upgrade() {
-                    return prepared_filter;
-                }
+                return Arc::clone(&entry.prepared_filter);
             }
         }
 
         let prepared_filter = Arc::new(OnceCell::new());
         entries.push(ExecutionPreparedFilterEntry {
             context: Arc::downgrade(context),
-            prepared_filter: Arc::downgrade(&prepared_filter),
+            prepared_filter: Arc::clone(&prepared_filter),
         });
         prepared_filter
     }
@@ -888,7 +885,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_filter_cache_is_scoped_to_live_execution_streams() {
+    fn prepared_filter_cache_is_scoped_to_live_task_contexts() {
         let cache = ExecutionPreparedFilterCache::default();
         let first_context = Arc::new(TaskContext::default());
         let first = cache.for_execution(&first_context);
@@ -902,10 +899,25 @@ mod tests {
         let expired = Arc::downgrade(&first);
         drop(first);
         drop(same_execution);
-        assert!(expired.upgrade().is_none());
+        assert!(
+            expired.upgrade().is_some(),
+            "the cache must keep the prepared filter alive while its task context is alive"
+        );
 
         let repeated_execution = cache.for_execution(&first_context);
-        assert!(expired.upgrade().is_none());
-        assert!(!Arc::ptr_eq(&repeated_execution, &second_execution));
+        assert!(Arc::ptr_eq(
+            &expired
+                .upgrade()
+                .expect("the live execution should retain its prepared filter"),
+            &repeated_execution
+        ));
+
+        drop(repeated_execution);
+        drop(first_context);
+        let _ = cache.for_execution(&second_context);
+        assert!(
+            expired.upgrade().is_none(),
+            "a later cache lookup should prune completed executions"
+        );
     }
 }
