@@ -20,7 +20,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -47,11 +49,11 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties,
+    PlanProperties, RecordBatchStream,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionConfig;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use paimon::spec::{Predicate, ROW_ID_FIELD_NAME};
 use paimon::table::{PreparedVectorSearchFilter, RowRange, Table};
 use paimon::vector_search::SearchResult;
@@ -460,7 +462,7 @@ struct ExecutionPreparedFilterEntry {
     context: Weak<TaskContext>,
     prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
     partition_count: usize,
-    unfinished_partitions: HashSet<usize>,
+    completed_partitions: HashSet<usize>,
     active_partition_leases: HashMap<usize, usize>,
 }
 
@@ -482,6 +484,7 @@ struct ExecutionPreparedFilterLease {
 impl ExecutionPreparedFilterLease {
     fn new(
         cache: &Arc<ExecutionPreparedFilterCache>,
+        context: Arc<TaskContext>,
         prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
         partition: usize,
     ) -> Self {
@@ -489,19 +492,17 @@ impl ExecutionPreparedFilterLease {
             prepared_filter: Arc::clone(&prepared_filter),
             _completion: Arc::new(ExecutionPartitionCompletion {
                 cache: Arc::downgrade(cache),
+                context,
                 prepared_filter,
                 partition,
             }),
         }
     }
-
-    fn prepared_filter(&self) -> &OnceCell<PreparedVectorSearchFilter> {
-        &self.prepared_filter
-    }
 }
 
 struct ExecutionPartitionCompletion {
     cache: Weak<ExecutionPreparedFilterCache>,
+    context: Arc<TaskContext>,
     prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
     partition: usize,
 }
@@ -509,7 +510,7 @@ struct ExecutionPartitionCompletion {
 impl Drop for ExecutionPartitionCompletion {
     fn drop(&mut self) {
         if let Some(cache) = self.cache.upgrade() {
-            cache.finish_partition(&self.prepared_filter, self.partition);
+            cache.finish_partition(&self.context, &self.prepared_filter, self.partition);
         }
     }
 }
@@ -532,10 +533,11 @@ impl ExecutionPreparedFilterCache {
                 continue;
             };
             if Arc::ptr_eq(&entry_context, context) && entry.partition_count == partition_count {
-                entry.unfinished_partitions.insert(partition);
+                entry.completed_partitions.remove(&partition);
                 *entry.active_partition_leases.entry(partition).or_default() += 1;
                 return ExecutionPreparedFilterLease::new(
                     self,
+                    Arc::clone(context),
                     Arc::clone(&entry.prepared_filter),
                     partition,
                 );
@@ -549,14 +551,15 @@ impl ExecutionPreparedFilterCache {
             context: Arc::downgrade(context),
             prepared_filter: Arc::clone(&prepared_filter),
             partition_count,
-            unfinished_partitions: (0..partition_count).collect(),
+            completed_partitions: HashSet::new(),
             active_partition_leases,
         });
-        ExecutionPreparedFilterLease::new(self, prepared_filter, partition)
+        ExecutionPreparedFilterLease::new(self, Arc::clone(context), prepared_filter, partition)
     }
 
     fn finish_partition(
         &self,
+        context: &Arc<TaskContext>,
         prepared_filter: &Arc<OnceCell<PreparedVectorSearchFilter>>,
         partition: usize,
     ) {
@@ -577,11 +580,67 @@ impl ExecutionPreparedFilterCache {
         *active_leases -= 1;
         if *active_leases == 0 {
             entry.active_partition_leases.remove(&partition);
-            entry.unfinished_partitions.remove(&partition);
+            entry.completed_partitions.insert(partition);
         }
-        if entry.unfinished_partitions.is_empty() {
+        if entry.active_partition_leases.is_empty()
+            && (Arc::strong_count(context) == 1
+                || entry.completed_partitions.len() == entry.partition_count)
+        {
             entries.remove(entry_index);
         }
+    }
+}
+
+struct ExecutionScopedStream {
+    schema: ArrowSchemaRef,
+    inner: Option<SendableRecordBatchStream>,
+    lease: Option<ExecutionPreparedFilterLease>,
+}
+
+impl ExecutionScopedStream {
+    fn new(
+        schema: ArrowSchemaRef,
+        inner: SendableRecordBatchStream,
+        lease: ExecutionPreparedFilterLease,
+    ) -> Self {
+        Self {
+            schema,
+            inner: Some(inner),
+            lease: Some(lease),
+        }
+    }
+
+    fn finish(&mut self) {
+        drop(self.inner.take());
+        drop(self.lease.take());
+    }
+}
+
+impl Stream for ExecutionScopedStream {
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let Some(inner) = &mut this.inner else {
+            return Poll::Ready(None);
+        };
+        let result = inner.as_mut().poll_next(cx);
+        if matches!(&result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            this.finish();
+        }
+        result
+    }
+}
+
+impl RecordBatchStream for ExecutionScopedStream {
+    fn schema(&self) -> ArrowSchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Drop for ExecutionScopedStream {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -639,7 +698,7 @@ impl LateralVectorSearchExec {
             return empty_batch(self.output_schema.clone());
         }
 
-        let (target_table, include_row_ids) = match &self.filter {
+        let prepared_filter = match &self.filter {
             Some(filter) => {
                 let prepared_filter = prepared_filter.ok_or_else(|| {
                     DataFusionError::Internal(
@@ -653,20 +712,20 @@ impl LateralVectorSearchExec {
                     })
                     .await
                     .map_err(to_datafusion_error)?;
-                (
-                    prepared.table(),
-                    Some(Arc::clone(prepared.include_row_ids())),
-                )
+                Some(prepared)
             }
-            None => (&self.target_table, None),
+            None => None,
         };
+        let target_table = prepared_filter
+            .map(PreparedVectorSearchFilter::table)
+            .unwrap_or(&self.target_table);
         let mut builder = target_table.new_batch_vector_search_builder();
         builder
             .with_vector_column(&self.target_column)
             .with_query_vectors(query_vectors)
             .with_limit(self.limit);
-        if let Some(include_row_ids) = include_row_ids {
-            builder.with_shared_include_row_ids(include_row_ids);
+        if let Some(prepared_filter) = prepared_filter {
+            builder.with_prepared_filter(prepared_filter.clone());
         }
         let results = builder.execute().await.map_err(to_datafusion_error)?;
 
@@ -770,25 +829,31 @@ impl ExecutionPlan for LateralVectorSearchExec {
                 self.input.output_partitioning().partition_count(),
             )
         });
+        let prepared_filter_cell = prepared_filter
+            .as_ref()
+            .map(|lease| Arc::clone(&lease.prepared_filter));
         let exec = self.clone();
         let stream = input.then(move |batch| {
             let exec = exec.clone();
-            let prepared_filter = prepared_filter.clone();
+            let prepared_filter_cell = prepared_filter_cell.clone();
             async move {
                 let batch = batch?;
-                exec.process_batch(
-                    batch,
-                    prepared_filter
-                        .as_ref()
-                        .map(ExecutionPreparedFilterLease::prepared_filter),
-                )
-                .await
+                exec.process_batch(batch, prepared_filter_cell.as_deref())
+                    .await
             }
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             self.output_schema.clone(),
             Box::pin(stream),
-        )))
+        ));
+        Ok(match prepared_filter {
+            Some(lease) => Box::pin(ExecutionScopedStream::new(
+                self.output_schema.clone(),
+                stream,
+                lease,
+            )),
+            None => stream,
+        })
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
@@ -980,6 +1045,25 @@ pub(crate) fn session_config() -> SessionConfig {
 mod tests {
     use super::*;
 
+    struct ContextHoldingStream {
+        schema: ArrowSchemaRef,
+        _context: Arc<TaskContext>,
+    }
+
+    impl Stream for ContextHoldingStream {
+        type Item = DFResult<RecordBatch>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl RecordBatchStream for ContextHoldingStream {
+        fn schema(&self) -> ArrowSchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
     #[test]
     fn prepared_filter_cache_releases_completed_execution() {
         let cache = Arc::new(ExecutionPreparedFilterCache::default());
@@ -1006,6 +1090,49 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    #[test]
+    fn prepared_filter_cache_releases_subset_execution_after_context_drop() {
+        let cache = Arc::new(ExecutionPreparedFilterCache::default());
+        let context = Arc::new(TaskContext::default());
+        let lease = cache.for_execution(&context, 0, 4);
+        let prepared_filter = Arc::downgrade(&lease.prepared_filter);
+
+        drop(context);
+        drop(lease);
+
+        assert!(
+            prepared_filter.upgrade().is_none(),
+            "unstarted declared partitions must not retain a completed execution"
+        );
+        assert!(cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[test]
+    fn execution_stream_cancellation_drops_inner_before_cache_lease() {
+        let cache = Arc::new(ExecutionPreparedFilterCache::default());
+        let context = Arc::new(TaskContext::default());
+        let lease = cache.for_execution(&context, 0, 4);
+        let prepared_filter = Arc::downgrade(&lease.prepared_filter);
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let inner: SendableRecordBatchStream = Box::pin(ContextHoldingStream {
+            schema: Arc::clone(&schema),
+            _context: Arc::clone(&context),
+        });
+        let stream = ExecutionScopedStream::new(schema, inner, lease);
+
+        drop(context);
+        drop(stream);
+
+        assert!(
+            prepared_filter.upgrade().is_none(),
+            "cancellation must drop the child stream's context before releasing the cache lease"
+        );
     }
 
     #[test]

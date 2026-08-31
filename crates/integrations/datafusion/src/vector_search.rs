@@ -401,13 +401,13 @@ impl VectorSearchExec {
         // recall is unchanged (data-evolution / global-index path; PK-vector tables are
         // unsupported here, as before).
         let mut search_result = await_with_runtime(async {
-            let mut builder = search_table.new_batch_vector_search_builder();
+            let mut builder = self.table.new_batch_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
                 .with_query_vectors(vec![self.query_vector.clone()])
                 .with_limit(self.search_limit);
             if let Some(prepared) = &prepared_filter {
-                builder.with_shared_include_row_ids(Arc::clone(prepared.include_row_ids()));
+                builder.with_prepared_filter(prepared.clone());
             }
             let mut results = builder.execute().await.map_err(to_datafusion_error)?;
             Ok::<_, DataFusionError>(results.remove(0))

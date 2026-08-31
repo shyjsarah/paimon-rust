@@ -45,6 +45,7 @@ use crate::table::pk_vector_position_read::{
 };
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
+use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::source::DataSplit;
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
@@ -197,6 +198,7 @@ pub struct BatchVectorSearchBuilder<'a> {
     projection: Option<Vec<String>>,
     filter: Option<Predicate>,
     include_row_ids: Option<Arc<RoaringTreemap>>,
+    prepared_filter: Option<PreparedVectorSearchFilter>,
 }
 
 /// A scalar vector pre-filter resolved once against one pinned snapshot.
@@ -1193,6 +1195,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             projection: None,
             filter: None,
             include_row_ids: None,
+            prepared_filter: None,
         }
     }
 
@@ -1222,26 +1225,30 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = Some(filter);
         self.include_row_ids = None;
+        self.prepared_filter = None;
         self
     }
 
-    /// Reuse row IDs from a previously prepared scalar pre-filter.
+    /// Attach a prepared scalar pre-filter together with the exact table
+    /// snapshot against which its row-ID allow-list was evaluated.
+    pub fn with_prepared_filter(
+        &mut self,
+        prepared_filter: PreparedVectorSearchFilter,
+    ) -> &mut Self {
+        self.prepared_filter = Some(prepared_filter);
+        self.filter = None;
+        self.include_row_ids = None;
+        self
+    }
+
+    /// Attach a caller-managed row-ID allow-list.
     ///
-    /// The builder's table must be [`PreparedVectorSearchFilter::table`] (or an
-    /// equivalent copy pinned to the same snapshot).
+    /// This low-level API does not bind the allow-list to a table snapshot.
+    /// Prefer [`Self::with_prepared_filter`] for scalar pre-filters.
     pub fn with_include_row_ids(&mut self, include_row_ids: RoaringTreemap) -> &mut Self {
         self.include_row_ids = Some(Arc::new(include_row_ids));
         self.filter = None;
-        self
-    }
-
-    /// Reuse a shared row-ID allow-list without copying its bitmap.
-    pub fn with_shared_include_row_ids(
-        &mut self,
-        include_row_ids: Arc<RoaringTreemap>,
-    ) -> &mut Self {
-        self.include_row_ids = Some(include_row_ids);
-        self.filter = None;
+        self.prepared_filter = None;
         self
     }
 
@@ -1261,7 +1268,12 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
         // so it must refuse a `query-auth.enabled` table before any fast path
         // (an empty snapshot would otherwise return empty results and bypass it).
-        let core = CoreOptions::new(self.table.schema().options());
+        let execution_table = self
+            .prepared_filter
+            .as_ref()
+            .map(PreparedVectorSearchFilter::table)
+            .unwrap_or(self.table);
+        let core = CoreOptions::new(execution_table.schema().options());
         core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
@@ -1318,11 +1330,19 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        let snapshot_manager = self.table.snapshot_manager();
+        if self
+            .prepared_filter
+            .as_ref()
+            .is_some_and(|prepared| prepared.include_row_ids().is_empty())
+        {
+            return Ok(vec![SearchResult::empty(); vector_searches.len()]);
+        }
+
+        let snapshot_manager = execution_table.snapshot_manager();
         let setup = total_start.map_or(Duration::ZERO, |start| start.elapsed());
 
         let snapshot_start = timing_enabled.then(Instant::now);
-        let snapshot = match crate::table::time_travel::resolve_snapshot(self.table).await? {
+        let snapshot = match crate::table::time_travel::resolve_snapshot(execution_table).await? {
             Some(s) => s,
             None => {
                 let snapshot = snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -1344,9 +1364,20 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             }
         };
         let snapshot_elapsed = snapshot_start.map_or(Duration::ZERO, |start| start.elapsed());
-        let pinned_table = self.table.copy_with_resolved_snapshot(&snapshot).await?;
+        let pinned_table = match &self.prepared_filter {
+            Some(prepared) => prepared.table().clone(),
+            None => {
+                execution_table
+                    .copy_with_resolved_snapshot(&snapshot)
+                    .await?
+            }
+        };
 
-        if let Some(include_row_ids) = &self.include_row_ids {
+        if let Some(prepared) = &self.prepared_filter {
+            for search in &mut vector_searches {
+                search.set_shared_include_row_ids(Arc::clone(prepared.include_row_ids()));
+            }
+        } else if let Some(include_row_ids) = &self.include_row_ids {
             if include_row_ids.is_empty() {
                 return Ok(vec![SearchResult::empty(); vector_searches.len()]);
             }
@@ -1368,7 +1399,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         let index_entries = match snapshot.index_manifest() {
             Some(index_manifest_name) => {
                 let manifest_path = snapshot_manager.manifest_path(index_manifest_name);
-                IndexManifest::read(self.table.file_io(), &manifest_path).await?
+                IndexManifest::read(execution_table.file_io(), &manifest_path).await?
             }
             None => Vec::new(),
         };
@@ -2856,6 +2887,35 @@ fn shared_batch_include_row_ids(vector_searches: &[VectorSearch]) -> Option<&Arc
         .then_some(first)
 }
 
+fn prune_raw_ranges_by_include_row_ids(
+    raw_ranges: &[RowRange],
+    vector_searches: &[VectorSearch],
+) -> crate::Result<Vec<RowRange>> {
+    if vector_searches
+        .iter()
+        .any(|search| search.effective_include_row_ids().is_none())
+    {
+        return Ok(raw_ranges.to_vec());
+    }
+
+    let include_ranges =
+        if let Some(include_row_ids) = shared_batch_include_row_ids(vector_searches) {
+            sorted_row_ids_to_row_ranges(include_row_ids.iter())?
+        } else {
+            let mut union = RoaringTreemap::new();
+            for include_row_ids in vector_searches
+                .iter()
+                .filter_map(VectorSearch::effective_include_row_ids)
+            {
+                for row_id in include_row_ids.iter() {
+                    union.insert(row_id);
+                }
+            }
+            sorted_row_ids_to_row_ranges(union.iter())?
+        };
+    Ok(intersect_sorted_ranges(raw_ranges, &include_ranges))
+}
+
 fn localize_include_row_ids(
     include_row_ids: &RoaringTreemap,
     row_range_start: i64,
@@ -3204,6 +3264,10 @@ async fn read_raw_batch_vector_search(
     if raw_ranges.is_empty() {
         return Ok((vec![SearchResult::empty(); vector_searches.len()], None));
     }
+    let raw_ranges = prune_raw_ranges_by_include_row_ids(raw_ranges, vector_searches)?;
+    if raw_ranges.is_empty() {
+        return Ok((vec![SearchResult::empty(); vector_searches.len()], None));
+    }
 
     let field_name = &vector_searches[0].field_name;
     if vector_searches
@@ -3221,7 +3285,7 @@ async fn read_raw_batch_vector_search(
     let mut read_builder = table.new_read_builder();
     read_builder
         .with_projection(&[field_name.as_str(), ROW_ID_FIELD_NAME])?
-        .with_row_ranges(raw_ranges.to_vec());
+        .with_row_ranges(raw_ranges);
     let plan = read_builder.new_scan().plan().await?;
     let plan_elapsed = plan_start.map_or(Duration::ZERO, |start| start.elapsed());
     let split_count = plan.splits().len();
@@ -3290,15 +3354,22 @@ async fn read_raw_batch_vector_search(
 
 struct RawScoringPlan {
     all_query_indices: Vec<usize>,
+    shared_filter_groups: Vec<SharedRawFilterGroup>,
     candidate_query_indices: HashMap<u64, Vec<usize>>,
     query_l2_squared_norms: Vec<f32>,
     dense_query_dimension: Option<usize>,
     dense_query_matrix: Option<Vec<f32>>,
 }
 
+struct SharedRawFilterGroup {
+    include_row_ids: Arc<RoaringTreemap>,
+    query_indices: Vec<usize>,
+}
+
 impl RawScoringPlan {
     fn new(vector_searches: &[VectorSearch], metric: RawVectorMetric) -> Self {
         let mut all_query_indices = Vec::new();
+        let mut shared_filter_groups = Vec::new();
         let mut candidate_query_indices: HashMap<u64, Vec<usize>> = HashMap::new();
         let query_l2_squared_norms = vector_searches
             .iter()
@@ -3312,16 +3383,23 @@ impl RawScoringPlan {
             })
             .collect();
 
-        for (query_index, vector_search) in vector_searches.iter().enumerate() {
-            if let Some(include_row_ids) = vector_search.effective_include_row_ids() {
-                for row_id in include_row_ids.iter() {
-                    candidate_query_indices
-                        .entry(row_id)
-                        .or_default()
-                        .push(query_index);
+        if let Some(include_row_ids) = shared_batch_include_row_ids(vector_searches) {
+            shared_filter_groups.push(SharedRawFilterGroup {
+                include_row_ids: Arc::clone(include_row_ids),
+                query_indices: (0..vector_searches.len()).collect(),
+            });
+        } else {
+            for (query_index, vector_search) in vector_searches.iter().enumerate() {
+                if let Some(include_row_ids) = vector_search.effective_include_row_ids() {
+                    for row_id in include_row_ids.iter() {
+                        candidate_query_indices
+                            .entry(row_id)
+                            .or_default()
+                            .push(query_index);
+                    }
+                } else {
+                    all_query_indices.push(query_index);
                 }
-            } else {
-                all_query_indices.push(query_index);
             }
         }
 
@@ -3344,6 +3422,7 @@ impl RawScoringPlan {
 
         Self {
             all_query_indices,
+            shared_filter_groups,
             candidate_query_indices,
             query_l2_squared_norms,
             dense_query_dimension,
@@ -3600,6 +3679,20 @@ fn collect_raw_batch_vector_batch(
                     scoring_plan,
                     top_k_out,
                 )?;
+            }
+        }
+        for group in &scoring_plan.shared_filter_groups {
+            if group.include_row_ids.contains(row_id) {
+                for &query_index in &group.query_indices {
+                    offer_raw_vector_score(
+                        raw_row,
+                        query_index,
+                        metric,
+                        vector_searches,
+                        scoring_plan,
+                        top_k_out,
+                    )?;
+                }
             }
         }
     }
@@ -4057,6 +4150,56 @@ mod tests {
             .clone()
             .with_include_row_ids(RoaringTreemap::from_iter([1, 2, 3]));
         assert!(shared_batch_include_row_ids(&owned).is_none());
+    }
+
+    #[test]
+    fn shared_raw_filter_does_not_expand_row_query_associations() {
+        let shared = Arc::new(RoaringTreemap::from_iter(0..1_000));
+        let mut searches = (0..128)
+            .map(|_| VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap())
+            .collect::<Vec<_>>();
+        for search in &mut searches {
+            search.set_shared_include_row_ids(Arc::clone(&shared));
+        }
+
+        let plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let expanded_associations = plan
+            .candidate_query_indices
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+
+        assert_eq!(
+            expanded_associations, 0,
+            "one shared bitmap must stay O(B + Q), not expand to O(B * Q)"
+        );
+        assert_eq!(plan.shared_filter_groups.len(), 1);
+        assert!(Arc::ptr_eq(
+            &plan.shared_filter_groups[0].include_row_ids,
+            &shared
+        ));
+        assert_eq!(plan.shared_filter_groups[0].query_indices.len(), 128);
+    }
+
+    #[test]
+    fn shared_raw_filter_prunes_unindexed_ranges_before_reading() {
+        let shared = Arc::new(RoaringTreemap::from_iter([7, 1_000, 1_001, 900_000]));
+        let mut searches = (0..128)
+            .map(|_| VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap())
+            .collect::<Vec<_>>();
+        for search in &mut searches {
+            search.set_shared_include_row_ids(Arc::clone(&shared));
+        }
+
+        let raw_ranges = vec![RowRange::new(0, 999_999)];
+        assert_eq!(
+            prune_raw_ranges_by_include_row_ids(&raw_ranges, &searches).unwrap(),
+            vec![
+                RowRange::new(7, 7),
+                RowRange::new(1_000, 1_001),
+                RowRange::new(900_000, 900_000),
+            ]
+        );
     }
 
     #[test]
@@ -7298,13 +7441,12 @@ mod tests {
             .prepare_vector_search_filter(id_gt_filter(&table, 1))
             .await
             .unwrap();
-        let results = prepared
-            .table()
+        let results = table
             .new_batch_vector_search_builder()
             .with_vector_column("embedding")
             .with_query_vectors(vec![vec![1.0, 0.0], vec![0.0, 1.0]])
             .with_limit(2)
-            .with_shared_include_row_ids(Arc::clone(prepared.include_row_ids()))
+            .with_prepared_filter(prepared)
             .execute()
             .await
             .unwrap();
