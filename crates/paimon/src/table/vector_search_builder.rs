@@ -1758,15 +1758,9 @@ async fn evaluate_batch_vector_search(
     let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
 
     let vector_entry_count = vector_entries.len();
-    let shared_include_row_ids =
-        vector_searches[0]
-            .effective_include_row_ids()
-            .filter(|include_row_ids| {
-                vector_searches
-                    .iter()
-                    .all(|search| search.effective_include_row_ids() == Some(*include_row_ids))
-            });
-    let vector_search_plans = if let Some(include_row_ids) = shared_include_row_ids {
+    let vector_search_plans = if let Some(include_row_ids) =
+        shared_batch_include_row_ids(vector_searches)
+    {
         let ranges = vector_entries
             .iter()
             .map(|entry| {
@@ -1785,7 +1779,10 @@ async fn evaluate_batch_vector_search(
         vector_entries
             .iter()
             .copied()
-            .zip(localize_shared_include_row_ids(include_row_ids, &ranges)?)
+            .zip(localize_shared_include_row_ids(
+                include_row_ids.as_ref(),
+                &ranges,
+            )?)
             .filter_map(|(entry, local_filter)| local_filter.map(|filter| (entry, Some(filter))))
             .collect::<Vec<_>>()
     } else {
@@ -2843,6 +2840,20 @@ fn row_id_to_i64_for_range(row_id: u64) -> crate::Result<i64> {
         ),
         source: None,
     })
+}
+
+fn shared_batch_include_row_ids(vector_searches: &[VectorSearch]) -> Option<&Arc<RoaringTreemap>> {
+    let first = vector_searches.first()?.shared_include_row_ids.as_ref()?;
+    vector_searches
+        .iter()
+        .skip(1)
+        .all(|search| {
+            search
+                .shared_include_row_ids
+                .as_ref()
+                .is_some_and(|include_row_ids| Arc::ptr_eq(first, include_row_ids))
+        })
+        .then_some(first)
 }
 
 fn localize_include_row_ids(
@@ -4021,6 +4032,31 @@ mod tests {
             vec![5]
         );
         assert!(localized[2].is_none(), "an empty shard must be skipped");
+    }
+
+    #[test]
+    fn shared_batch_include_filter_requires_the_same_arc() {
+        let shared = Arc::new(RoaringTreemap::from_iter([1, 2, 3]));
+        let mut shared_searches = vec![
+            VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap(),
+            VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap(),
+        ];
+        for search in &mut shared_searches {
+            search.set_shared_include_row_ids(Arc::clone(&shared));
+        }
+        let detected = shared_batch_include_row_ids(&shared_searches).unwrap();
+        assert!(Arc::ptr_eq(detected, &shared));
+
+        let mut equal_but_distinct = shared_searches.clone();
+        equal_but_distinct[1]
+            .set_shared_include_row_ids(Arc::new(RoaringTreemap::from_iter([1, 2, 3])));
+        assert!(shared_batch_include_row_ids(&equal_but_distinct).is_none());
+
+        let mut owned = shared_searches;
+        owned[1] = owned[1]
+            .clone()
+            .with_include_row_ids(RoaringTreemap::from_iter([1, 2, 3]));
+        assert!(shared_batch_include_row_ids(&owned).is_none());
     }
 
     #[test]
