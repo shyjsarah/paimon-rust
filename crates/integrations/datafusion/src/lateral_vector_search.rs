@@ -17,7 +17,7 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
@@ -459,42 +459,129 @@ struct LateralVectorSearchExec {
 struct ExecutionPreparedFilterEntry {
     context: Weak<TaskContext>,
     prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    partition_count: usize,
+    unfinished_partitions: HashSet<usize>,
+    active_partition_leases: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Default)]
 struct ExecutionPreparedFilterCache {
     // DataFusion passes the same TaskContext Arc to every partition of one
     // execution. Keep the prepared filter alive for that TaskContext so
-    // sequential partitions resolve the same target snapshot. The weak context
-    // lets a later lookup prune completed executions.
+    // sequential partitions resolve the same target snapshot. Completion
+    // leases remove the exact entry as soon as every partition finishes.
     entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
+}
+
+#[derive(Clone)]
+struct ExecutionPreparedFilterLease {
+    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    _completion: Arc<ExecutionPartitionCompletion>,
+}
+
+impl ExecutionPreparedFilterLease {
+    fn new(
+        cache: &Arc<ExecutionPreparedFilterCache>,
+        prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+        partition: usize,
+    ) -> Self {
+        Self {
+            prepared_filter: Arc::clone(&prepared_filter),
+            _completion: Arc::new(ExecutionPartitionCompletion {
+                cache: Arc::downgrade(cache),
+                prepared_filter,
+                partition,
+            }),
+        }
+    }
+
+    fn prepared_filter(&self) -> &OnceCell<PreparedVectorSearchFilter> {
+        &self.prepared_filter
+    }
+}
+
+struct ExecutionPartitionCompletion {
+    cache: Weak<ExecutionPreparedFilterCache>,
+    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    partition: usize,
+}
+
+impl Drop for ExecutionPartitionCompletion {
+    fn drop(&mut self) {
+        if let Some(cache) = self.cache.upgrade() {
+            cache.finish_partition(&self.prepared_filter, self.partition);
+        }
+    }
 }
 
 impl ExecutionPreparedFilterCache {
     fn for_execution(
-        &self,
+        self: &Arc<Self>,
         context: &Arc<TaskContext>,
-    ) -> Arc<OnceCell<PreparedVectorSearchFilter>> {
+        partition: usize,
+        partition_count: usize,
+    ) -> ExecutionPreparedFilterLease {
+        debug_assert!(partition < partition_count);
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.retain(|entry| entry.context.strong_count() > 0);
-        for entry in entries.iter() {
+        for entry in entries.iter_mut() {
             let Some(entry_context) = entry.context.upgrade() else {
                 continue;
             };
-            if Arc::ptr_eq(&entry_context, context) {
-                return Arc::clone(&entry.prepared_filter);
+            if Arc::ptr_eq(&entry_context, context) && entry.partition_count == partition_count {
+                entry.unfinished_partitions.insert(partition);
+                *entry.active_partition_leases.entry(partition).or_default() += 1;
+                return ExecutionPreparedFilterLease::new(
+                    self,
+                    Arc::clone(&entry.prepared_filter),
+                    partition,
+                );
             }
         }
 
         let prepared_filter = Arc::new(OnceCell::new());
+        let mut active_partition_leases = HashMap::new();
+        active_partition_leases.insert(partition, 1);
         entries.push(ExecutionPreparedFilterEntry {
             context: Arc::downgrade(context),
             prepared_filter: Arc::clone(&prepared_filter),
+            partition_count,
+            unfinished_partitions: (0..partition_count).collect(),
+            active_partition_leases,
         });
-        prepared_filter
+        ExecutionPreparedFilterLease::new(self, prepared_filter, partition)
+    }
+
+    fn finish_partition(
+        &self,
+        prepared_filter: &Arc<OnceCell<PreparedVectorSearchFilter>>,
+        partition: usize,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry_index) = entries
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.prepared_filter, prepared_filter))
+        else {
+            return;
+        };
+        let entry = &mut entries[entry_index];
+        let Some(active_leases) = entry.active_partition_leases.get_mut(&partition) else {
+            return;
+        };
+        *active_leases -= 1;
+        if *active_leases == 0 {
+            entry.active_partition_leases.remove(&partition);
+            entry.unfinished_partitions.remove(&partition);
+        }
+        if entry.unfinished_partitions.is_empty() {
+            entries.remove(entry_index);
+        }
     }
 }
 
@@ -675,18 +762,27 @@ impl ExecutionPlan for LateralVectorSearchExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let prepared_filter = self
-            .filter
-            .as_ref()
-            .map(|_| self.prepared_filter_cache.for_execution(&context));
-        let input = self.input.execute(partition, context)?;
+        let input = self.input.execute(partition, Arc::clone(&context))?;
+        let prepared_filter = self.filter.as_ref().map(|_| {
+            self.prepared_filter_cache.for_execution(
+                &context,
+                partition,
+                self.input.output_partitioning().partition_count(),
+            )
+        });
         let exec = self.clone();
         let stream = input.then(move |batch| {
             let exec = exec.clone();
             let prepared_filter = prepared_filter.clone();
             async move {
                 let batch = batch?;
-                exec.process_batch(batch, prepared_filter.as_deref()).await
+                exec.process_batch(
+                    batch,
+                    prepared_filter
+                        .as_ref()
+                        .map(ExecutionPreparedFilterLease::prepared_filter),
+                )
+                .await
             }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -885,39 +981,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_filter_cache_is_scoped_to_live_task_contexts() {
-        let cache = ExecutionPreparedFilterCache::default();
-        let first_context = Arc::new(TaskContext::default());
-        let first = cache.for_execution(&first_context);
-        let same_execution = cache.for_execution(&first_context);
-        assert!(Arc::ptr_eq(&first, &same_execution));
+    fn prepared_filter_cache_releases_completed_execution() {
+        let cache = Arc::new(ExecutionPreparedFilterCache::default());
+        let context = Arc::new(TaskContext::default());
+        let first = cache.for_execution(&context, 0, 2);
+        let prepared_filter = Arc::downgrade(&first.prepared_filter);
 
-        let second_context = Arc::new(TaskContext::default());
-        let second_execution = cache.for_execution(&second_context);
-        assert!(!Arc::ptr_eq(&first, &second_execution));
-
-        let expired = Arc::downgrade(&first);
         drop(first);
-        drop(same_execution);
-        assert!(
-            expired.upgrade().is_some(),
-            "the cache must keep the prepared filter alive while its task context is alive"
-        );
-
-        let repeated_execution = cache.for_execution(&first_context);
+        let second = cache.for_execution(&context, 1, 2);
         assert!(Arc::ptr_eq(
-            &expired
+            &prepared_filter
                 .upgrade()
-                .expect("the live execution should retain its prepared filter"),
-            &repeated_execution
+                .expect("an unfinished execution should retain its prepared filter"),
+            &second.prepared_filter
         ));
 
-        drop(repeated_execution);
-        drop(first_context);
-        let _ = cache.for_execution(&second_context);
+        drop(second);
         assert!(
-            expired.upgrade().is_none(),
-            "a later cache lookup should prune completed executions"
+            prepared_filter.upgrade().is_none(),
+            "finishing every partition should release the prepared filter even while the task context remains alive"
         );
+        assert!(cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[test]
+    fn prepared_filter_cache_evicts_only_the_completed_execution() {
+        let cache = Arc::new(ExecutionPreparedFilterCache::default());
+        let first_context = Arc::new(TaskContext::default());
+        let second_context = Arc::new(TaskContext::default());
+        let first = cache.for_execution(&first_context, 0, 1);
+        let second = cache.for_execution(&second_context, 0, 1);
+        let first_filter = Arc::downgrade(&first.prepared_filter);
+        let second_filter = Arc::downgrade(&second.prepared_filter);
+
+        drop(first);
+
+        assert!(first_filter.upgrade().is_none());
+        assert!(
+            second_filter.upgrade().is_some(),
+            "completing one execution must not evict another execution's filter"
+        );
+        assert_eq!(
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+
+        drop(second);
+        assert!(second_filter.upgrade().is_none());
+    }
+
+    #[test]
+    fn prepared_filter_cache_waits_for_all_lease_clones() {
+        let cache = Arc::new(ExecutionPreparedFilterCache::default());
+        let context = Arc::new(TaskContext::default());
+        let lease = cache.for_execution(&context, 0, 1);
+        let lease_clone = lease.clone();
+        let prepared_filter = Arc::downgrade(&lease.prepared_filter);
+
+        drop(lease);
+        assert!(
+            prepared_filter.upgrade().is_some(),
+            "in-flight batch futures may retain a cloned lease"
+        );
+
+        drop(lease_clone);
+        assert!(prepared_filter.upgrade().is_none());
     }
 }
