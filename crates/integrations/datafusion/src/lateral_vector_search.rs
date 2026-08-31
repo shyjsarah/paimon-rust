@@ -20,7 +20,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -451,8 +451,54 @@ struct LateralVectorSearchExec {
     limit: usize,
     output_schema: ArrowSchemaRef,
     filter: Option<Predicate>,
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter_cache: Arc<ExecutionPreparedFilterCache>,
     plan_properties: Arc<PlanProperties>,
+}
+
+#[derive(Debug)]
+struct ExecutionPreparedFilterEntry {
+    context: Weak<TaskContext>,
+    prepared_filter: Weak<OnceCell<PreparedVectorSearchFilter>>,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionPreparedFilterCache {
+    // DataFusion passes the same TaskContext Arc to every partition of one
+    // execution. Weak references let those partitions share one prepared filter
+    // while ensuring a later execution of the reusable plan starts fresh.
+    entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
+}
+
+impl ExecutionPreparedFilterCache {
+    fn for_execution(
+        &self,
+        context: &Arc<TaskContext>,
+    ) -> Arc<OnceCell<PreparedVectorSearchFilter>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| {
+            entry.context.strong_count() > 0 && entry.prepared_filter.strong_count() > 0
+        });
+        for entry in entries.iter() {
+            let Some(entry_context) = entry.context.upgrade() else {
+                continue;
+            };
+            if Arc::ptr_eq(&entry_context, context) {
+                if let Some(prepared_filter) = entry.prepared_filter.upgrade() {
+                    return prepared_filter;
+                }
+            }
+        }
+
+        let prepared_filter = Arc::new(OnceCell::new());
+        entries.push(ExecutionPreparedFilterEntry {
+            context: Arc::downgrade(context),
+            prepared_filter: Arc::downgrade(&prepared_filter),
+        });
+        prepared_filter
+    }
 }
 
 impl LateralVectorSearchExec {
@@ -481,7 +527,7 @@ impl LateralVectorSearchExec {
             limit,
             output_schema,
             filter: None,
-            prepared_filter: Arc::new(OnceCell::new()),
+            prepared_filter_cache: Arc::new(ExecutionPreparedFilterCache::default()),
             plan_properties,
         }
     }
@@ -491,7 +537,11 @@ impl LateralVectorSearchExec {
         self
     }
 
-    async fn process_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
+    async fn process_batch(
+        &self,
+        batch: RecordBatch,
+        prepared_filter: Option<&OnceCell<PreparedVectorSearchFilter>>,
+    ) -> DFResult<RecordBatch> {
         if batch.num_rows() == 0 {
             return empty_batch(self.output_schema.clone());
         }
@@ -507,8 +557,12 @@ impl LateralVectorSearchExec {
 
         let (target_table, include_row_ids) = match &self.filter {
             Some(filter) => {
-                let prepared = self
-                    .prepared_filter
+                let prepared_filter = prepared_filter.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "filtered lateral vector search is missing execution state".to_string(),
+                    )
+                })?;
+                let prepared = prepared_filter
                     .get_or_try_init(|| {
                         self.target_table
                             .prepare_vector_search_filter(filter.clone())
@@ -615,7 +669,7 @@ impl ExecutionPlan for LateralVectorSearchExec {
         if let Some(filter) = &self.filter {
             exec = exec.with_filter(filter.clone());
         }
-        exec.prepared_filter = Arc::clone(&self.prepared_filter);
+        exec.prepared_filter_cache = Arc::clone(&self.prepared_filter_cache);
         Ok(Arc::new(exec))
     }
 
@@ -624,13 +678,18 @@ impl ExecutionPlan for LateralVectorSearchExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let prepared_filter = self
+            .filter
+            .as_ref()
+            .map(|_| self.prepared_filter_cache.for_execution(&context));
         let input = self.input.execute(partition, context)?;
         let exec = self.clone();
         let stream = input.then(move |batch| {
             let exec = exec.clone();
+            let prepared_filter = prepared_filter.clone();
             async move {
                 let batch = batch?;
-                exec.process_batch(batch).await
+                exec.process_batch(batch, prepared_filter.as_deref()).await
             }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -822,4 +881,31 @@ fn empty_batch(schema: ArrowSchemaRef) -> DFResult<RecordBatch> {
 
 pub(crate) fn session_config() -> SessionConfig {
     SessionConfig::new().with_information_schema(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_filter_cache_is_scoped_to_live_execution_streams() {
+        let cache = ExecutionPreparedFilterCache::default();
+        let first_context = Arc::new(TaskContext::default());
+        let first = cache.for_execution(&first_context);
+        let same_execution = cache.for_execution(&first_context);
+        assert!(Arc::ptr_eq(&first, &same_execution));
+
+        let second_context = Arc::new(TaskContext::default());
+        let second_execution = cache.for_execution(&second_context);
+        assert!(!Arc::ptr_eq(&first, &second_execution));
+
+        let expired = Arc::downgrade(&first);
+        drop(first);
+        drop(same_execution);
+        assert!(expired.upgrade().is_none());
+
+        let repeated_execution = cache.for_execution(&first_context);
+        assert!(expired.upgrade().is_none());
+        assert!(!Arc::ptr_eq(&repeated_execution, &second_execution));
+    }
 }

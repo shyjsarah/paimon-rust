@@ -1727,6 +1727,7 @@ mod vector_search_tests {
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::collect;
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema, VarCharType};
     use paimon::table::BranchManager;
@@ -2370,6 +2371,104 @@ mod vector_search_tests {
             extract_query_result_ids(&cross_side_filter),
             vec![(10, 2)],
             "cross-side conjuncts must remain residual"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lateral_vector_search_reused_plan_refreshes_scalar_prefilter_snapshot() {
+        let (ctx, catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'id', \
+             index_type => 'btree')",
+        )
+        .await
+        .expect("initial BTree index build SQL should parse")
+        .collect()
+        .await
+        .expect("initial BTree index build should execute");
+
+        let query_batch = build_vector_batch(vec![10], vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        let query_table = MemTable::try_new(query_batch.schema(), vec![vec![query_batch]])
+            .expect("Failed to create query vector table");
+        ctx.register_temp_table("paimon.default.refresh_queries", Arc::new(query_table))
+            .expect("Failed to register query vector table");
+
+        let dataframe = ctx
+            .sql(
+                "SELECT r.id \
+                 FROM paimon.default.refresh_queries q \
+                 CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+                 WHERE r.id = 6",
+            )
+            .await
+            .expect("filtered lateral vector_search SQL should parse");
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .expect("physical plan should be created");
+
+        let first = collect(Arc::clone(&physical_plan), ctx.ctx().task_ctx())
+            .await
+            .expect("first physical-plan execution should succeed");
+        assert!(extract_ids_in_order(&first).is_empty());
+
+        let identifier = Identifier::new("default", "test_java_vindex_vector");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("load vector target table");
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("configure target append");
+        let mut writer = write_builder.new_write().expect("create target writer");
+        writer
+            .write_arrow_batch(&build_vector_batch(vec![6], vec![vec![1.0, 0.0, 0.0, 0.0]]))
+            .await
+            .expect("append target row");
+        let messages = writer
+            .prepare_commit()
+            .await
+            .expect("prepare target append");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("commit target append");
+
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'embedding', \
+             index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=4,ivf-flat.nlist=1,ivf-flat.distance.metric=l2')",
+        )
+        .await
+        .expect("incremental vector index build SQL should parse")
+        .collect()
+        .await
+        .expect("incremental vector index build should execute");
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'id', \
+             index_type => 'btree')",
+        )
+        .await
+        .expect("incremental BTree index build SQL should parse")
+        .collect()
+        .await
+        .expect("incremental BTree index build should execute");
+
+        let second = collect(physical_plan, ctx.ctx().task_ctx())
+            .await
+            .expect("reused physical-plan execution should succeed");
+        assert_eq!(
+            extract_ids_in_order(&second),
+            vec![6],
+            "a reused physical plan must prepare the scalar filter from the new execution snapshot"
         );
     }
 
