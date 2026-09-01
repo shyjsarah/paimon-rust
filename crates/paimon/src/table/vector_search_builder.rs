@@ -1270,6 +1270,9 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
         let timing_enabled = vector_search_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
+        // The builder target is authoritative for current auth/type policy.
+        // A prepared filter only pins a snapshot and may carry older options.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         if let Some(prepared) = &self.prepared_filter {
             if !same_vector_search_table(self.table, prepared.table()) {
                 return Err(crate::Error::DataInvalid {
@@ -1284,10 +1287,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
                 });
             }
         }
-        // Fail closed: like `execute_read` and the single-query builder, this
-        // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
-        // so it must refuse a `query-auth.enabled` table before any fast path
-        // (an empty snapshot would otherwise return empty results and bypass it).
+        // Check the pinned execution view as defense in depth before any fast
+        // path returns data-derived row ids/scores outside TableScan/TableRead.
         let execution_table = self
             .prepared_filter
             .as_ref()
@@ -5088,6 +5089,34 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "batch vector search must fail closed for a query-auth table, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_filter_cannot_bypass_builder_target_query_auth() {
+        let source = vector_test_table();
+        let prepared = source
+            .prepare_vector_search_filter(id_gt_filter(&source, 0))
+            .await
+            .unwrap();
+        let target = source.copy_with_options(HashMap::from([(
+            "query-auth.enabled".to_string(),
+            "true".to_string(),
+        )]));
+
+        let err = target
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0, 0.0]])
+            .with_limit(1)
+            .with_prepared_filter(prepared)
+            .execute()
+            .await
+            .expect_err("a stale prepared filter must not bypass current target authorization");
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "builder target authorization must remain authoritative, got: {err:?}"
         );
     }
 
