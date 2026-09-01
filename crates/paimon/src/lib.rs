@@ -30,6 +30,7 @@ pub mod btree;
 pub mod catalog;
 mod deletion_vector;
 pub mod file_index;
+mod fm_index;
 #[cfg(feature = "fulltext")]
 pub mod ftindex;
 #[cfg(feature = "fulltext")]
@@ -48,12 +49,12 @@ pub use catalog::CatalogFactory;
 pub use catalog::FileSystemCatalog;
 
 pub use table::{
-    CommitMessage, DataEvolutionDeleteWriter, DataEvolutionWriter, DataSplit, DataSplitBuilder,
-    DeletionFile, IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
-    PartitionBucket, Plan, PostponeBucketPlan, PostponeFixedBucketTableCommit,
-    PostponeFixedBucketTableWrite, RESTEnv, RESTSnapshotCommit, ReadBuilder,
-    RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager, Table,
-    TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
+    BlobReader, BlobStream, CommitMessage, DataEvolutionDeleteWriter, DataEvolutionWriter,
+    DataSplit, DataSplitBuilder, DeletionFile, IncrementalPlan, IncrementalScan,
+    IncrementalScanMode, IncrementalSplit, PartitionBucket, Plan, PostponeBucketPlan,
+    PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite, RESTEnv, RESTSnapshotCommit,
+    ReadBuilder, RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager,
+    Table, TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
 };
 
 pub use table::{
