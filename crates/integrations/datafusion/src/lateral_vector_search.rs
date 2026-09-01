@@ -21,8 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -470,9 +472,11 @@ struct ExecutionPreparedFilterEntry {
 struct ExecutionPreparedFilterCache {
     // DataFusion passes the same TaskContext Arc to every partition of one
     // execution. Keep the prepared filter alive for that TaskContext so
-    // sequential partitions resolve the same target snapshot. Completion
-    // leases remove the exact entry as soon as every partition finishes.
+    // sequential partitions resolve the same target snapshot. DataFusion 54
+    // exposes no TaskContext drop hook, so one cache-level reaper observes the
+    // weak contexts and removes subset executions after their context dies.
     entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
+    reaper_running: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -535,12 +539,15 @@ impl ExecutionPreparedFilterCache {
             if Arc::ptr_eq(&entry_context, context) && entry.partition_count == partition_count {
                 entry.completed_partitions.remove(&partition);
                 *entry.active_partition_leases.entry(partition).or_default() += 1;
-                return ExecutionPreparedFilterLease::new(
+                let lease = ExecutionPreparedFilterLease::new(
                     self,
                     Arc::clone(context),
                     Arc::clone(&entry.prepared_filter),
                     partition,
                 );
+                drop(entries);
+                self.ensure_context_reaper();
+                return lease;
             }
         }
 
@@ -554,7 +561,55 @@ impl ExecutionPreparedFilterCache {
             completed_partitions: HashSet::new(),
             active_partition_leases,
         });
-        ExecutionPreparedFilterLease::new(self, Arc::clone(context), prepared_filter, partition)
+        let lease = ExecutionPreparedFilterLease::new(
+            self,
+            Arc::clone(context),
+            prepared_filter,
+            partition,
+        );
+        drop(entries);
+        self.ensure_context_reaper();
+        lease
+    }
+
+    fn ensure_context_reaper(self: &Arc<Self>) {
+        if self.reaper_running.swap(true, AtomicOrdering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.reaper_running.store(false, AtomicOrdering::Release);
+            return;
+        };
+        let cache = Arc::downgrade(self);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let Some(cache) = cache.upgrade() else {
+                    return;
+                };
+                if cache.prune_dead_contexts() {
+                    cache.reaper_running.store(false, AtomicOrdering::Release);
+                    let has_entries = !cache
+                        .entries
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty();
+                    if has_entries {
+                        cache.ensure_context_reaper();
+                    }
+                    return;
+                }
+            }
+        });
+    }
+
+    fn prune_dead_contexts(&self) -> bool {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| entry.context.strong_count() > 0);
+        entries.is_empty()
     }
 
     fn finish_partition(
@@ -1106,6 +1161,34 @@ mod tests {
             prepared_filter.upgrade().is_none(),
             "unstarted declared partitions must not retain a completed execution"
         );
+        assert!(cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_filter_cache_releases_when_context_drops_after_stream() {
+        let cache = Arc::new(ExecutionPreparedFilterCache::default());
+        let context = Arc::new(TaskContext::default());
+        let lease = cache.for_execution(&context, 0, 4);
+        let prepared_filter = Arc::downgrade(&lease.prepared_filter);
+
+        drop(lease);
+        assert!(
+            prepared_filter.upgrade().is_some(),
+            "the retained context must keep sequential partition reuse possible"
+        );
+        drop(context);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while prepared_filter.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the execution context must trigger cache cleanup");
         assert!(cache
             .entries
             .lock()

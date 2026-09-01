@@ -221,6 +221,11 @@ impl PreparedVectorSearchFilter {
     }
 }
 
+fn same_vector_search_table(left: &Table, right: &Table) -> bool {
+    left.location().trim_end_matches('/') == right.location().trim_end_matches('/')
+        && left.branch() == right.branch()
+}
+
 /// The primary-key vector route's search output plus the source context a later
 /// materialization (or a hybrid fusion across routes) needs. `candidates` are the
 /// best-first hits; `splits` are the per-bucket source splits their `split_index`
@@ -1264,6 +1269,20 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
         let timing_enabled = vector_search_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
+        if let Some(prepared) = &self.prepared_filter {
+            if !same_vector_search_table(self.table, prepared.table()) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Prepared vector search filter belongs to a different table: builder target is '{}@{}', prepared filter target is '{}@{}'",
+                        self.table.location(),
+                        self.table.branch(),
+                        prepared.table().location(),
+                        prepared.table().branch(),
+                    ),
+                    source: None,
+                });
+            }
+        }
         // Fail closed: like `execute_read` and the single-query builder, this
         // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
         // so it must refuse a `query-auth.enabled` table before any fast path
@@ -4067,6 +4086,10 @@ mod tests {
     }
 
     fn vector_test_table() -> Table {
+        vector_test_table_at("memory:/vector_test")
+    }
+
+    fn vector_test_table_at(location: &str) -> Table {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column(
@@ -4078,7 +4101,7 @@ mod tests {
         Table::new(
             FileIOBuilder::new("memory").build().unwrap(),
             Identifier::new("default", "vector_test"),
-            "memory:/vector_test".to_string(),
+            location.to_string(),
             TableSchema::new(0, &schema),
             None,
         )
@@ -7454,6 +7477,30 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].row_ids, vec![2, 1]);
         assert_eq!(results[1].row_ids, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn prepared_filter_from_different_table_is_rejected() {
+        let prepared = PreparedVectorSearchFilter {
+            table: vector_test_table_at("memory:/prepared_filter_source"),
+            include_row_ids: Arc::new(RoaringTreemap::from_iter([1])),
+        };
+        let target = vector_test_table_at("memory:/prepared_filter_target");
+
+        let error = target
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0, 0.0]])
+            .with_limit(1)
+            .with_prepared_filter(prepared)
+            .execute()
+            .await
+            .expect_err("a prepared filter must not retarget the builder to another table");
+
+        assert!(
+            error.to_string().contains("different table"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

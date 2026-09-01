@@ -431,7 +431,9 @@ impl PreparedSearch {
     fn same_batch_group(&self, other: &Self) -> bool {
         self.params == other.params
             && match (&self.filter_bytes, &other.filter_bytes) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (Some(left), Some(right)) => {
+                    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
+                }
                 (None, None) => true,
                 _ => false,
             }
@@ -1538,11 +1540,10 @@ mod tests {
         for row_id in (0..256).step_by(16) {
             include_row_ids.insert(row_id);
         }
-        let include_row_ids = Arc::new(include_row_ids);
-        let mut searches = vec![query(), query()];
-        for search in &mut searches {
-            search.set_shared_include_row_ids(Arc::clone(&include_row_ids));
-        }
+        let searches = vec![
+            query().with_include_row_ids(include_row_ids.clone()),
+            query().with_include_row_ids(include_row_ids),
+        ];
 
         let scalar_tracking = TrackingIndexRead::new(index.clone());
         let scalar_source: Arc<dyn FileRead> = scalar_tracking.clone();
